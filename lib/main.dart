@@ -10,7 +10,7 @@ void main() {
   runApp(const MyApp());
 }
 
-// Global instance to ensure sign-in/sign-out consistency
+// Global instance for consistent sign-in/out
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
   serverClientId: AppConfig.googleWebClientId,
@@ -51,7 +51,6 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       final auth = await account.authentication;
-
       if (auth.idToken == null) throw "ID Token is null";
 
       final res = await http.post(
@@ -155,20 +154,31 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   late String userName;
-  File? localImage; // To hold newly picked file
-  String? remoteImageUrl; // To hold URL from DB
+  File? localImage;
+  String? remoteImageUrl;
   bool _isSaving = false;
+
+  // Swiping Logic Variables
+  int _currentIndex = 0;
+  late PageController _pageController;
 
   @override
   void initState() {
     super.initState();
     userName = widget.name;
+    _pageController = PageController(initialPage: _currentIndex);
+
     if (widget.profileImageUrl != null && widget.profileImageUrl!.isNotEmpty) {
       remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
     }
   }
 
-  // Helper to decide which image source to use
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
   ImageProvider? _getImageProvider(File? local, String? remote) {
     if (local != null) return FileImage(local);
     if (remote != null) return NetworkImage(remote);
@@ -256,11 +266,9 @@ class _HomePageState extends State<HomePage> {
       var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
       request.fields['email'] = widget.email;
       request.fields['profile_name'] = name;
-
       if (image != null) {
         request.files.add(await http.MultipartFile.fromPath('profile_image', image.path));
       }
-
       var response = await request.send();
       return response.statusCode == 200;
     } catch (e) {
@@ -284,7 +292,8 @@ class _HomePageState extends State<HomePage> {
                 radius: 18,
                 backgroundImage: _getImageProvider(localImage, remoteImageUrl),
                 child: (localImage == null && remoteImageUrl == null)
-                    ? const Icon(Icons.person, size: 18) : null,
+                    ? const Icon(Icons.person, size: 18)
+                    : null,
               ),
               const SizedBox(width: 10),
               Text(userName),
@@ -303,9 +312,61 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-      body: Center(
-        child: Text("Welcome $userName 👋", style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+
+      // 🔹 PageView enables the swiping gesture
+      body: PageView(
+        controller: _pageController,
+        onPageChanged: (index) {
+          setState(() => _currentIndex = index);
+        },
+        children: [
+          homeContent(),
+          const StatsPage(),
+          const AllStatsPage(),
+        ],
+      ),
+
+      // 🔹 BottomNavigationBar syncs with PageView
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        onTap: (index) {
+          _pageController.animateToPage(
+            index,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeInOut,
+          );
+        },
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
+          BottomNavigationBarItem(icon: Icon(Icons.bar_chart), label: "Stats"),
+          BottomNavigationBarItem(icon: Icon(Icons.leaderboard), label: "All Stats"),
+        ],
       ),
     );
+  }
+
+  Widget homeContent() {
+    return Center(
+      child: Text("Welcome $userName 👋",
+          style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+    );
+  }
+}
+
+/* ========================= SUB PAGES ========================= */
+
+class StatsPage extends StatelessWidget {
+  const StatsPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const Center(child: Text("My Stats 📊", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)));
+  }
+}
+
+class AllStatsPage extends StatelessWidget {
+  const AllStatsPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const Center(child: Text("All Stats 🏆", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)));
   }
 }
