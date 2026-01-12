@@ -5,12 +5,15 @@ import 'dart:convert';
 import 'config.dart';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
+import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+
 
 void main() {
   runApp(const MyApp());
 }
 
-// Global instance to maintain session consistency across the app
+// Global instance for consistent sign-in/out
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
   serverClientId: AppConfig.googleWebClientId,
@@ -106,7 +109,6 @@ class _LoginPageState extends State<LoginPage> {
         child: Center(
           child: Card(
             elevation: 15,
-            shadowColor: Colors.black45,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
             child: Padding(
               padding: const EdgeInsets.all(32),
@@ -116,10 +118,7 @@ class _LoginPageState extends State<LoginPage> {
                   const Icon(Icons.bolt_rounded, size: 70, color: Colors.blueAccent),
                   const SizedBox(height: 16),
                   const Text("Campus Connect",
-                      style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, letterSpacing: -0.5)),
-                  const SizedBox(height: 8),
-                  Text("Fitness tracking for students",
-                      style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                      style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)),
                   const SizedBox(height: 40),
                   SizedBox(
                     width: 240,
@@ -135,7 +134,6 @@ class _LoginPageState extends State<LoginPage> {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.white,
                         foregroundColor: Colors.black87,
-                        elevation: 2,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                       ),
                     ),
@@ -168,21 +166,42 @@ class _HomePageState extends State<HomePage> {
   File? localImage;
   String? remoteImageUrl;
   bool _isSaving = false;
+  bool isJogging = false;
+
   int _currentIndex = 0;
   late PageController _pageController;
+  late IO.Socket socket;
+  List<dynamic> activeJoggers = [];
 
   @override
   void initState() {
     super.initState();
     userName = widget.name;
     _pageController = PageController(initialPage: _currentIndex);
+
     if (widget.profileImageUrl != null && widget.profileImageUrl!.isNotEmpty) {
       remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
     }
+
+    // SOCKET SETUP
+    socket = IO.io(
+      AppConfig.socketUrl,
+      IO.OptionBuilder()
+          .setTransports(['websocket'])
+          .disableAutoConnect()
+          .build(),
+    );
+
+    socket.connect();
+    socket.on("active_joggers", (data) {
+      if (mounted) setState(() => activeJoggers = data);
+    });
   }
 
   @override
   void dispose() {
+    socket.off("active_joggers");
+    socket.dispose();
     _pageController.dispose();
     super.dispose();
   }
@@ -193,32 +212,26 @@ class _HomePageState extends State<HomePage> {
     return null;
   }
 
-  /* ---------------- HOME PAGE UI COMPONENTS ---------------- */
+  /* ---------------- HOME CONTENT ---------------- */
 
   Widget homeContent() {
-    return Container(
-      color: Colors.grey.shade50,
-      child: Column(
-        children: [
-          topDashboard(),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            child: Row(
-              children: [
-                Icon(Icons.radar, color: Colors.redAccent, size: 18),
-                SizedBox(width: 8),
-                Text("LIVE STADIUM TRACK",
-                    style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.2, fontSize: 12)),
-                Spacer(),
-                CircleAvatar(radius: 4, backgroundColor: Colors.redAccent),
-                SizedBox(width: 6),
-                Text("LIVE", style: TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-              ],
-            ),
+    return Column(
+      children: [
+        topDashboard(),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+          child: Row(
+            children: [
+              Icon(Icons.radar, color: Colors.redAccent, size: 18),
+              SizedBox(width: 8),
+              Text("LIVE TRACK", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12)),
+              Spacer(),
+              Text("LIVE", style: TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+            ],
           ),
-          Expanded(child: groundView()),
-        ],
-      ),
+        ),
+        Expanded(child: groundView()),
+      ],
     );
   }
 
@@ -243,17 +256,14 @@ class _HomePageState extends State<HomePage> {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(24),
-        boxShadow: [
-          BoxShadow(color: color.withOpacity(0.12), blurRadius: 20, offset: const Offset(0, 8)),
-        ],
+        boxShadow: [BoxShadow(color: color.withOpacity(0.12), blurRadius: 20, offset: const Offset(0, 8))],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Icon(icon, color: color, size: 22),
           const SizedBox(height: 12),
-          Text(title, style: TextStyle(fontSize: 10, color: Colors.grey.shade600, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 4),
+          Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
           Text(value, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900)),
         ],
       ),
@@ -261,36 +271,38 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget groundView() {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF121212),
-        borderRadius: BorderRadius.circular(32),
-        boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 20, offset: const Offset(0, 10))],
-      ),
+    return GestureDetector(
+      onTap: showStartJogDialog,
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(32),
-        child: Stack(
-          children: [
-            Center(
-              child: Container(
-                width: 260, height: 480,
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.white.withOpacity(0.03), width: 40),
-                  borderRadius: BorderRadius.circular(130),
-                ),
+        borderRadius: BorderRadius.circular(24),
+        child: GoogleMap(
+          initialCameraPosition: const CameraPosition(
+            target: LatLng(17.385044, 78.486671), // college / ground location
+            zoom: 17,
+          ),
+          markers: activeJoggers.map((j) {
+            return Marker(
+              markerId: MarkerId(j['socketId'] ?? j['name']),
+              position: LatLng(
+                (j['lat'] ?? 0.5) + 17.385044,
+                (j['lng'] ?? 0.2) + 78.486671,
               ),
-            ),
-            runnerDot(80, 150, Colors.blueAccent, "https://i.pravatar.cc/150?u=1"),
-            runnerDot(200, 300, Colors.orangeAccent, "https://i.pravatar.cc/150?u=2"),
-            runnerDot(130, 450, Colors.greenAccent, "https://i.pravatar.cc/150?u=3"),
-          ],
+              icon: BitmapDescriptor.defaultMarkerWithHue(
+                BitmapDescriptor.hueAzure,
+              ),
+              infoWindow: InfoWindow(title: j['name']),
+            );
+          }).toSet(),
+          myLocationEnabled: false, // GPS comes later
+          zoomControlsEnabled: false,
+          mapToolbarEnabled: false,
         ),
       ),
     );
   }
 
-  Widget runnerDot(double x, double y, Color color, String imageUrl) {
+
+  Widget runnerDot(double x, double y, Color color, String? imageUrl) {
     return Positioned(
       left: x, top: y,
       child: TweenAnimationBuilder<double>(
@@ -304,8 +316,11 @@ class _HomePageState extends State<HomePage> {
                 width: 25 + (value * 20), height: 25 + (value * 20),
                 decoration: BoxDecoration(shape: BoxShape.circle, color: color.withOpacity(1 - value)),
               ),
-              CircleAvatar(radius: 12, backgroundColor: color,
-                  child: CircleAvatar(radius: 10, backgroundImage: NetworkImage(imageUrl))),
+              CircleAvatar(
+                radius: 12, backgroundColor: color,
+                backgroundImage: (imageUrl != null && imageUrl.isNotEmpty) ? NetworkImage(imageUrl) : null,
+                child: (imageUrl == null || imageUrl.isEmpty) ? const Icon(Icons.person, size: 12) : null,
+              ),
             ],
           );
         },
@@ -314,7 +329,38 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /* ---------------- PROFILE & NAVIGATION ---------------- */
+  /* ---------------- LOGIC FUNCTIONS ---------------- */
+
+  void showStartJogDialog() {
+    if (isJogging) return;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Start Session"),
+        content: const Text("Join the ground? Your location will be shared live."),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Later")),
+          ElevatedButton(onPressed: () { Navigator.pop(context); startJog(); }, child: const Text("Start")),
+        ],
+      ),
+    );
+  }
+
+  void startJog() {
+    setState(() => isJogging = true);
+    socket.emit("start_jog", {
+      "name": userName,
+      "avatar": remoteImageUrl ?? "",
+      "lat": 0.5, "lng": 0.2, // We'll add GPS later
+    });
+  }
+
+  void stopJog() {
+    setState(() => isJogging = false);
+    socket.emit("stop_jog");
+  }
+
+  /* ---------------- PROFILE SHEET ---------------- */
 
   void openProfileSheet() {
     final controller = TextEditingController(text: userName);
@@ -323,7 +369,6 @@ class _HomePageState extends State<HomePage> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.white,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(32))),
       builder: (context) => StatefulBuilder(
         builder: (context, setSheetState) => Padding(
@@ -340,23 +385,15 @@ class _HomePageState extends State<HomePage> {
                 },
                 child: CircleAvatar(
                   radius: 55,
-                  backgroundColor: Colors.blue.shade50,
                   backgroundImage: tempPickedImage != null
                       ? FileImage(tempPickedImage!)
                       : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
                   child: tempPickedImage == null && remoteImageUrl == null
-                      ? const Icon(Icons.camera_enhance_rounded, size: 35, color: Colors.blue) : null,
+                      ? const Icon(Icons.camera_alt, size: 35) : null,
                 ),
               ),
               const SizedBox(height: 24),
-              TextField(
-                controller: controller,
-                decoration: InputDecoration(
-                  labelText: "Full Name",
-                  prefixIcon: const Icon(Icons.person_outline),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
-                ),
-              ),
+              TextField(controller: controller, decoration: const InputDecoration(labelText: "Full Name")),
               const SizedBox(height: 24),
               SizedBox(
                 width: double.infinity, height: 55,
@@ -378,11 +415,7 @@ class _HomePageState extends State<HomePage> {
                       setSheetState(() => _isSaving = false);
                     }
                   },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blueAccent, foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  ),
-                  child: _isSaving ? const CircularProgressIndicator(color: Colors.white) : const Text("Save Changes"),
+                  child: _isSaving ? const CircularProgressIndicator() : const Text("Save"),
                 ),
               ),
             ],
@@ -397,28 +430,19 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: false,
-        elevation: 0,
         backgroundColor: Colors.white,
         title: GestureDetector(
           onTap: openProfileSheet,
           child: Row(
             children: [
-              CircleAvatar(radius: 20, backgroundColor: Colors.blue.shade50,
-                  backgroundImage: _getImageProvider(localImage, remoteImageUrl),
-                  child: (localImage == null && remoteImageUrl == null) ? const Icon(Icons.person, size: 20) : null),
+              CircleAvatar(radius: 20, backgroundImage: _getImageProvider(localImage, remoteImageUrl)),
               const SizedBox(width: 12),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text("Hello,", style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-                  Text(userName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                ],
-              ),
+              Text(userName, style: const TextStyle(fontWeight: FontWeight.bold)),
             ],
           ),
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.logout_rounded, color: Colors.redAccent),
+          IconButton(icon: const Icon(Icons.logout, color: Colors.redAccent),
               onPressed: () async {
                 await _googleSignIn.signOut();
                 if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
@@ -430,20 +454,14 @@ class _HomePageState extends State<HomePage> {
         onPageChanged: (i) => setState(() => _currentIndex = i),
         children: [homeContent(), const StatsPage(), const AllStatsPage()],
       ),
-      bottomNavigationBar: Container(
-        decoration: BoxDecoration(boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
-        child: BottomNavigationBar(
-          currentIndex: _currentIndex,
-          selectedItemColor: Colors.blueAccent,
-          unselectedItemColor: Colors.grey,
-          showUnselectedLabels: false,
-          onTap: (i) => _pageController.animateToPage(i, duration: const Duration(milliseconds: 300), curve: Curves.easeInOut),
-          items: const [
-            BottomNavigationBarItem(icon: Icon(Icons.home_filled), label: "Home"),
-            BottomNavigationBarItem(icon: Icon(Icons.bar_chart_rounded), label: "My Stats"),
-            BottomNavigationBarItem(icon: Icon(Icons.leaderboard_rounded), label: "All Stats"),
-          ],
-        ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        onTap: (i) => _pageController.animateToPage(i, duration: const Duration(milliseconds: 300), curve: Curves.easeInOut),
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
+          BottomNavigationBarItem(icon: Icon(Icons.bar_chart), label: "Stats"),
+          BottomNavigationBarItem(icon: Icon(Icons.public), label: "Global"),
+        ],
       ),
     );
   }
@@ -454,11 +472,11 @@ class _HomePageState extends State<HomePage> {
 class StatsPage extends StatelessWidget {
   const StatsPage({super.key});
   @override
-  Widget build(BuildContext context) => const Center(child: Text("Personal Analytics coming soon..."));
+  Widget build(BuildContext context) => const Center(child: Text("My Stats"));
 }
 
 class AllStatsPage extends StatelessWidget {
   const AllStatsPage({super.key});
   @override
-  Widget build(BuildContext context) => const Center(child: Text("Global Leaderboard coming soon..."));
+  Widget build(BuildContext context) => const Center(child: Text("Leaderboard"));
 }

@@ -9,6 +9,7 @@ android {
     namespace = "com.example.campus_jogger_flutter"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+    val mapsApiKey: String = (project.findProperty("MAPS_API_KEY") as? String) ?: ""
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -28,6 +29,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders.put("MAPS_API_KEY", mapsApiKey)
     }
 
     buildTypes {
