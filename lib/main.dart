@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'config.dart';
 
 void main() {
   runApp(const MyApp());
@@ -34,8 +35,7 @@ class _LoginPageState extends State<LoginPage> {
 
     final googleSignIn = GoogleSignIn(
       scopes: ['email'],
-      serverClientId:
-      '555276203920-lie05jsbfg0g2aqkv35djsikvh8q5gmv.apps.googleusercontent.com',
+      serverClientId: AppConfig.googleWebClientId,
     );
 
     try {
@@ -52,9 +52,7 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       final res = await http.post(
-        Uri.parse(
-          "https://13edc446cc21.ngrok-free.app/campus_api/google_login.php",
-        ),
+        Uri.parse(AppConfig.backendUrl),
         body: {
           "id_token": auth.idToken!,
         },
