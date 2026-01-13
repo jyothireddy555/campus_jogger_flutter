@@ -6,7 +6,8 @@ import 'config.dart';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
-import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
 
 void main() {
   runApp(const MyApp());
@@ -148,9 +149,15 @@ class _HomePageState extends State<HomePage> {
   late PageController _pageController;
   late IO.Socket socket;
   List<dynamic> activeJoggers = [];
+  final MapController _mapController = MapController();
+
 
   // Ground Center Coordinates (Update these to your specific campus ground)
-  final LatLng _groundCenter = const LatLng(14.337511736151649, 78.5380059109949);
+  final LatLngBounds groundBounds = LatLngBounds(
+    LatLng(14.337061, 78.536599), // South-West corner
+    LatLng(14.337592, 78.539344), // North-East corner
+  );
+
 
   @override
   void initState() {
@@ -243,37 +250,52 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget groundView() {
-    //
-    Set<Marker> markers = activeJoggers.map((j) {
-      return Marker(
-        markerId: MarkerId(j['email'] ?? j['name'] ?? DateTime.now().toString()),
-        position: LatLng(
-          _groundCenter.latitude + (j['lat'] ?? 0.0),
-          _groundCenter.longitude + (j['lng'] ?? 0.0),
-        ),
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
-        infoWindow: InfoWindow(title: j['name']),
-      );
-    }).toSet();
-
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(24),
-        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 10)],
+        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)],
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(24),
-        child: GoogleMap(
-          //mapType: MapType.hybrid,
-          initialCameraPosition: CameraPosition(target: _groundCenter, zoom: 17.5),
-          markers: markers,
-          zoomControlsEnabled: true,
-          mapToolbarEnabled: true,
-        ),
+        child: FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCameraFit: CameraFit.bounds(
+              bounds: groundBounds,
+              padding: const EdgeInsets.fromLTRB(60, 30, 60, 30),
+            ),
+
+            // 🔥 ROTATE MAP
+            initialRotation: 90, // degrees
+          ),
+          children: [
+            TileLayer(
+              urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+              userAgentPackageName: 'com.example.campusconnect',
+            ),
+
+            MarkerLayer(
+              markers: activeJoggers.map((j) {
+                return Marker(
+                  width: 36,
+                  height: 36,
+                  point: LatLng(j['lat'], j['lng']),
+                  child: const Icon(
+                    Icons.directions_run,
+                    color: Colors.red,
+                    size: 28,
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        )
       ),
     );
   }
+
+
 
   /* ---------------- LOGIC ---------------- */
 
