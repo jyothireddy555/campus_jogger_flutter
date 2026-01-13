@@ -8,12 +8,10 @@ import 'package:image_picker/image_picker.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-
 void main() {
   runApp(const MyApp());
 }
 
-// Global instance for consistent sign-in/out
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
   serverClientId: AppConfig.googleWebClientId,
@@ -59,8 +57,6 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       final auth = await account.authentication;
-      if (auth.idToken == null) throw "ID Token is null";
-
       final res = await http.post(
         Uri.parse(AppConfig.backendUrl),
         body: {"id_token": auth.idToken!},
@@ -86,7 +82,7 @@ class _LoginPageState extends State<LoginPage> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Authentication failed. Please try again.")),
+          const SnackBar(content: Text("Authentication failed")),
         );
       }
     } finally {
@@ -100,11 +96,7 @@ class _LoginPageState extends State<LoginPage> {
       body: Container(
         width: double.infinity,
         decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF6A11CB), Color(0xFF2575FC)],
-          ),
+          gradient: LinearGradient(colors: [Color(0xFF6A11CB), Color(0xFF2575FC)]),
         ),
         child: Center(
           child: Card(
@@ -116,27 +108,12 @@ class _LoginPageState extends State<LoginPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   const Icon(Icons.bolt_rounded, size: 70, color: Colors.blueAccent),
-                  const SizedBox(height: 16),
-                  const Text("Campus Connect",
-                      style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)),
+                  const Text("Campus Connect", style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 40),
-                  SizedBox(
-                    width: 240,
-                    height: 55,
-                    child: ElevatedButton.icon(
-                      icon: _loading
-                          ? const SizedBox.shrink()
-                          : Image.asset("assets/google.png", height: 24),
-                      label: _loading
-                          ? const CircularProgressIndicator(strokeWidth: 3)
-                          : const Text("Sign in with Google", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                      onPressed: _loading ? null : () => signIn(context),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.black87,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                      ),
-                    ),
+                  ElevatedButton.icon(
+                    onPressed: _loading ? null : () => signIn(context),
+                    icon: _loading ? const SizedBox.shrink() : Image.asset("assets/google.png", height: 24),
+                    label: _loading ? const CircularProgressIndicator() : const Text("Sign in with Google"),
                   ),
                 ],
               ),
@@ -167,30 +144,27 @@ class _HomePageState extends State<HomePage> {
   String? remoteImageUrl;
   bool _isSaving = false;
   bool isJogging = false;
-
   int _currentIndex = 0;
   late PageController _pageController;
   late IO.Socket socket;
   List<dynamic> activeJoggers = [];
+
+  // Ground Center Coordinates (Update these to your specific campus ground)
+  final LatLng _groundCenter = const LatLng(14.337511736151649, 78.5380059109949);
 
   @override
   void initState() {
     super.initState();
     userName = widget.name;
     _pageController = PageController(initialPage: _currentIndex);
-
     if (widget.profileImageUrl != null && widget.profileImageUrl!.isNotEmpty) {
       remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
     }
 
-    // SOCKET SETUP
-    socket = IO.io(
-      AppConfig.socketUrl,
-      IO.OptionBuilder()
-          .setTransports(['websocket'])
-          .disableAutoConnect()
-          .build(),
-    );
+    socket = IO.io(AppConfig.socketUrl, IO.OptionBuilder()
+        .setTransports(['websocket'])
+        .disableAutoConnect()
+        .build());
 
     socket.connect();
     socket.on("active_joggers", (data) {
@@ -206,27 +180,60 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  ImageProvider? _getImageProvider(File? local, String? remote) {
-    if (local != null) return FileImage(local);
-    if (remote != null) return NetworkImage(remote);
-    return null;
-  }
+  /* ---------------- UI HELPERS ---------------- */
 
-  /* ---------------- HOME CONTENT ---------------- */
+  Widget statCard(String title, String value, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [BoxShadow(color: color.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(height: 10),
+          Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+          Text(value, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
 
   Widget homeContent() {
     return Column(
       children: [
-        topDashboard(),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+        Padding(
+          padding: const EdgeInsets.all(16.0),
           child: Row(
             children: [
-              Icon(Icons.radar, color: Colors.redAccent, size: 18),
-              SizedBox(width: 8),
-              Text("LIVE TRACK", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12)),
-              Spacer(),
-              Text("LIVE", style: TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+              Expanded(child: statCard("Early Bird", "Rahul", Icons.wb_sunny, Colors.orange)),
+              const SizedBox(width: 10),
+              Expanded(child: statCard("Top Run", "8.4 km", Icons.whatshot, Colors.redAccent)),
+              const SizedBox(width: 10),
+              Expanded(child: statCard("Personal", "2.1 km", Icons.person, Colors.blueAccent)),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.radar, color: Colors.redAccent, size: 18),
+              const SizedBox(width: 8),
+              const Text("LIVE TRACK", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+              const Spacer(),
+              ElevatedButton(
+                onPressed: isJogging ? stopJog : showStartJogDialog,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isJogging ? Colors.red : Colors.green,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                ),
+                child: Text(isJogging ? "STOP" : "START"),
+              ),
             ],
           ),
         ),
@@ -235,104 +242,42 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget topDashboard() {
-    return Padding(
-      padding: const EdgeInsets.all(16.0),
-      child: Row(
-        children: [
-          Expanded(child: statCard("Early Bird", "Rahul", Icons.wb_sunny_rounded, Colors.orange)),
-          const SizedBox(width: 12),
-          Expanded(child: statCard("Top Run", "8.4 km", Icons.whatshot_rounded, Colors.redAccent)),
-          const SizedBox(width: 12),
-          Expanded(child: statCard("Personal", "2.1 km", Icons.person_rounded, Colors.blueAccent)),
-        ],
-      ),
-    );
-  }
-
-  Widget statCard(String title, String value, IconData icon, Color color) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: [BoxShadow(color: color.withOpacity(0.12), blurRadius: 20, offset: const Offset(0, 8))],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: color, size: 22),
-          const SizedBox(height: 12),
-          Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
-          Text(value, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900)),
-        ],
-      ),
-    );
-  }
-
   Widget groundView() {
-    return GestureDetector(
-      onTap: showStartJogDialog,
+    //
+    Set<Marker> markers = activeJoggers.map((j) {
+      return Marker(
+        markerId: MarkerId(j['email'] ?? j['name'] ?? DateTime.now().toString()),
+        position: LatLng(
+          _groundCenter.latitude + (j['lat'] ?? 0.0),
+          _groundCenter.longitude + (j['lng'] ?? 0.0),
+        ),
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
+        infoWindow: InfoWindow(title: j['name']),
+      );
+    }).toSet();
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 10)],
+      ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(24),
         child: GoogleMap(
-          initialCameraPosition: const CameraPosition(
-            target: LatLng(17.385044, 78.486671), // college / ground location
-            zoom: 17,
-          ),
-          markers: activeJoggers.map((j) {
-            return Marker(
-              markerId: MarkerId(j['socketId'] ?? j['name']),
-              position: LatLng(
-                (j['lat'] ?? 0.5) + 17.385044,
-                (j['lng'] ?? 0.2) + 78.486671,
-              ),
-              icon: BitmapDescriptor.defaultMarkerWithHue(
-                BitmapDescriptor.hueAzure,
-              ),
-              infoWindow: InfoWindow(title: j['name']),
-            );
-          }).toSet(),
-          myLocationEnabled: false, // GPS comes later
-          zoomControlsEnabled: false,
-          mapToolbarEnabled: false,
+          //mapType: MapType.hybrid,
+          initialCameraPosition: CameraPosition(target: _groundCenter, zoom: 17.5),
+          markers: markers,
+          zoomControlsEnabled: true,
+          mapToolbarEnabled: true,
         ),
       ),
     );
   }
 
-
-  Widget runnerDot(double x, double y, Color color, String? imageUrl) {
-    return Positioned(
-      left: x, top: y,
-      child: TweenAnimationBuilder<double>(
-        tween: Tween(begin: 0.0, end: 1.0),
-        duration: const Duration(seconds: 2),
-        builder: (context, value, child) {
-          return Stack(
-            alignment: Alignment.center,
-            children: [
-              Container(
-                width: 25 + (value * 20), height: 25 + (value * 20),
-                decoration: BoxDecoration(shape: BoxShape.circle, color: color.withOpacity(1 - value)),
-              ),
-              CircleAvatar(
-                radius: 12, backgroundColor: color,
-                backgroundImage: (imageUrl != null && imageUrl.isNotEmpty) ? NetworkImage(imageUrl) : null,
-                child: (imageUrl == null || imageUrl.isEmpty) ? const Icon(Icons.person, size: 12) : null,
-              ),
-            ],
-          );
-        },
-        onEnd: () => setState(() {}),
-      ),
-    );
-  }
-
-  /* ---------------- LOGIC FUNCTIONS ---------------- */
+  /* ---------------- LOGIC ---------------- */
 
   void showStartJogDialog() {
-    if (isJogging) return;
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -351,7 +296,7 @@ class _HomePageState extends State<HomePage> {
     socket.emit("start_jog", {
       "name": userName,
       "avatar": remoteImageUrl ?? "",
-      "lat": 0.5, "lng": 0.2, // We'll add GPS later
+      "lat": 0.0002, "lng": 0.0003, // Tiny realistic offsets
     });
   }
 
@@ -360,11 +305,9 @@ class _HomePageState extends State<HomePage> {
     socket.emit("stop_jog");
   }
 
-  /* ---------------- PROFILE SHEET ---------------- */
-
   void openProfileSheet() {
     final controller = TextEditingController(text: userName);
-    File? tempPickedImage = localImage;
+    File? tempImage = localImage;
 
     showModalBottomSheet(
       context: context,
@@ -379,43 +322,38 @@ class _HomePageState extends State<HomePage> {
             children: [
               GestureDetector(
                 onTap: () async {
-                  final picker = ImagePicker();
-                  final picked = await picker.pickImage(source: ImageSource.gallery);
-                  if (picked != null) setSheetState(() => tempPickedImage = File(picked.path));
+                  final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+                  if (picked != null) setSheetState(() => tempImage = File(picked.path));
                 },
                 child: CircleAvatar(
                   radius: 55,
-                  backgroundImage: tempPickedImage != null
-                      ? FileImage(tempPickedImage!)
+                  backgroundImage: tempImage != null ? FileImage(tempImage!)
                       : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
-                  child: tempPickedImage == null && remoteImageUrl == null
-                      ? const Icon(Icons.camera_alt, size: 35) : null,
+                  child: tempImage == null && remoteImageUrl == null ? const Icon(Icons.camera_alt) : null,
                 ),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
               TextField(controller: controller, decoration: const InputDecoration(labelText: "Full Name")),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
               SizedBox(
-                width: double.infinity, height: 55,
+                width: double.infinity,
                 child: ElevatedButton(
                   onPressed: _isSaving ? null : () async {
                     setSheetState(() => _isSaving = true);
                     var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
                     request.fields['email'] = widget.email;
                     request.fields['profile_name'] = controller.text;
-                    if (tempPickedImage != null) {
-                      request.files.add(await http.MultipartFile.fromPath('profile_image', tempPickedImage!.path));
+                    if (tempImage != null) {
+                      request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
                     }
                     var response = await request.send();
-                    if (mounted) {
-                      if (response.statusCode == 200) {
-                        setState(() { userName = controller.text; localImage = tempPickedImage; });
-                        Navigator.pop(context);
-                      }
-                      setSheetState(() => _isSaving = false);
+                    if (mounted && response.statusCode == 200) {
+                      setState(() { userName = controller.text; localImage = tempImage; });
+                      Navigator.pop(context);
                     }
+                    if (mounted) setSheetState(() => _isSaving = false);
                   },
-                  child: _isSaving ? const CircularProgressIndicator() : const Text("Save"),
+                  child: const Text("Save"),
                 ),
               ),
             ],
@@ -435,18 +373,25 @@ class _HomePageState extends State<HomePage> {
           onTap: openProfileSheet,
           child: Row(
             children: [
-              CircleAvatar(radius: 20, backgroundImage: _getImageProvider(localImage, remoteImageUrl)),
+              CircleAvatar(
+                radius: 20,
+                backgroundImage: localImage != null ? FileImage(localImage!)
+                    : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
+                child: localImage == null && remoteImageUrl == null ? const Icon(Icons.person) : null,
+              ),
               const SizedBox(width: 12),
-              Text(userName, style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text(userName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
             ],
           ),
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.logout, color: Colors.redAccent),
-              onPressed: () async {
-                await _googleSignIn.signOut();
-                if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
-              }),
+          IconButton(
+            icon: const Icon(Icons.logout, color: Colors.redAccent),
+            onPressed: () async {
+              await _googleSignIn.signOut();
+              if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
+            },
+          ),
         ],
       ),
       body: PageView(
@@ -466,8 +411,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
-
-/* ========================= SUB PAGES ========================= */
 
 class StatsPage extends StatelessWidget {
   const StatsPage({super.key});
