@@ -8,6 +8,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'dart:async';
 
 void main() {
   runApp(const MyApp());
@@ -15,6 +17,7 @@ void main() {
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
+  // Note: For mobile, serverClientId is often unnecessary or requires the specific Android/iOS ID.
   serverClientId: AppConfig.googleWebClientId,
 );
 
@@ -113,7 +116,7 @@ class _LoginPageState extends State<LoginPage> {
                   const SizedBox(height: 40),
                   ElevatedButton.icon(
                     onPressed: _loading ? null : () => signIn(context),
-                    icon: _loading ? const SizedBox.shrink() : Image.asset("assets/google.png", height: 24),
+                    icon: _loading ? const SizedBox.shrink() : const Icon(Icons.login),
                     label: _loading ? const CircularProgressIndicator() : const Text("Sign in with Google"),
                   ),
                 ],
@@ -150,14 +153,14 @@ class _HomePageState extends State<HomePage> {
   late IO.Socket socket;
   List<dynamic> activeJoggers = [];
   final MapController _mapController = MapController();
+  LatLng? _myCurrentPos;
+  Timer? _animationTimer;
+  Timer? _locationTimer;
 
-
-  // Ground Center Coordinates (Update these to your specific campus ground)
   final LatLngBounds groundBounds = LatLngBounds(
-    LatLng(14.337061, 78.536599), // South-West corner
-    LatLng(14.337592, 78.539344), // North-East corner
+    LatLng(14.337061, 78.536599),
+    LatLng(14.337592, 78.539344),
   );
-
 
   @override
   void initState() {
@@ -174,20 +177,121 @@ class _HomePageState extends State<HomePage> {
         .build());
 
     socket.connect();
+
+    socket.onConnect((_) => debugPrint("✅ SOCKET CONNECTED"));
+    socket.onDisconnect((_) => debugPrint("❌ SOCKET DISCONNECTED"));
+
     socket.on("active_joggers", (data) {
-      if (mounted) setState(() => activeJoggers = data);
+      if (!mounted) return;
+      debugPrint("RECEIVED JOGGERS => $data");
+
+      // Handle self-interpolation for smooth movement
+      final me = (data as List).firstWhere(
+            (j) => j['name'] == userName,
+        orElse: () => null,
+      );
+
+      if (me != null) {
+        final newPos = LatLng(me['lat'], me['lng']);
+        if (_myCurrentPos == null) {
+          setState(() => _myCurrentPos = newPos);
+        } else {
+          animateTo(_myCurrentPos!, newPos);
+        }
+      }
+
+      setState(() => activeJoggers = data);
     });
   }
 
   @override
   void dispose() {
+    _locationTimer?.cancel();
+    _animationTimer?.cancel();
     socket.off("active_joggers");
     socket.dispose();
     _pageController.dispose();
     super.dispose();
   }
 
-  /* ---------------- UI HELPERS ---------------- */
+  Future<LatLng> _determinePosition() async {
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) throw "Location services are disabled.";
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) throw "Location permissions are denied.";
+    }
+
+    if (permission == LocationPermission.deniedForever) throw "Location permissions permanently denied.";
+
+    final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+    return LatLng(pos.latitude, pos.longitude);
+  }
+
+  void animateTo(LatLng from, LatLng to) {
+    _animationTimer?.cancel();
+    const int steps = 15;
+    int currentStep = 0;
+
+    final double latStep = (to.latitude - from.latitude) / steps;
+    final double lngStep = (to.longitude - from.longitude) / steps;
+
+    _animationTimer = Timer.periodic(const Duration(milliseconds: 60), (timer) {
+      if (!mounted) { timer.cancel(); return; }
+      currentStep++;
+      if (currentStep >= steps) {
+        timer.cancel();
+        setState(() => _myCurrentPos = to);
+      } else {
+        setState(() {
+          _myCurrentPos = LatLng(
+            from.latitude + (latStep * currentStep),
+            from.longitude + (lngStep * currentStep),
+          );
+        });
+      }
+    });
+  }
+
+  void startJog() async {
+    try {
+      final loc = await _determinePosition();
+      setState(() => isJogging = true);
+
+      socket.emit("start_jog", {
+        "name": userName,
+        "lat": loc.latitude,
+        "lng": loc.longitude,
+      });
+
+      _locationTimer?.cancel();
+      _locationTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+        if (!mounted || !isJogging) return;
+        try {
+          final liveLoc = await _determinePosition();
+          socket.emit("update_location", {
+            "lat": liveLoc.latitude,
+            "lng": liveLoc.longitude,
+          });
+        } catch (e) {
+          debugPrint("Live update error: $e");
+        }
+      });
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  void stopJog() {
+    setState(() => isJogging = false);
+    _locationTimer?.cancel();
+    _animationTimer?.cancel();
+    socket.emit("stop_jog");
+  }
+
+  /* ---------------- UI COMPONENTS ---------------- */
 
   Widget statCard(String title, String value, IconData icon, Color color) {
     return Container(
@@ -265,39 +369,37 @@ class _HomePageState extends State<HomePage> {
               bounds: groundBounds,
               padding: const EdgeInsets.fromLTRB(60, 30, 60, 30),
             ),
-
-            // 🔥 ROTATE MAP
-            initialRotation: 90, // degrees
+            initialRotation: 90,
           ),
           children: [
             TileLayer(
               urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
               userAgentPackageName: 'com.example.campusconnect',
             ),
-
             MarkerLayer(
-              markers: activeJoggers.map((j) {
-                return Marker(
+              markers: [
+                // Others
+                ...activeJoggers.where((j) => j['name'] != userName).map((j) => Marker(
                   width: 36,
                   height: 36,
                   point: LatLng(j['lat'], j['lng']),
-                  child: const Icon(
-                    Icons.directions_run,
-                    color: Colors.red,
-                    size: 28,
+                  child: const Icon(Icons.directions_run, color: Colors.red, size: 28),
+                )),
+                // Self (Animated)
+                if (_myCurrentPos != null)
+                  Marker(
+                    width: 40,
+                    height: 40,
+                    point: _myCurrentPos!,
+                    child: const Icon(Icons.directions_run, color: Colors.blue, size: 32),
                   ),
-                );
-              }).toList(),
+              ],
             ),
           ],
-        )
+        ),
       ),
     );
   }
-
-
-
-  /* ---------------- LOGIC ---------------- */
 
   void showStartJogDialog() {
     showDialog(
@@ -311,20 +413,6 @@ class _HomePageState extends State<HomePage> {
         ],
       ),
     );
-  }
-
-  void startJog() {
-    setState(() => isJogging = true);
-    socket.emit("start_jog", {
-      "name": userName,
-      "avatar": remoteImageUrl ?? "",
-      "lat": 0.0002, "lng": 0.0003, // Tiny realistic offsets
-    });
-  }
-
-  void stopJog() {
-    setState(() => isJogging = false);
-    socket.emit("stop_jog");
   }
 
   void openProfileSheet() {
@@ -362,18 +450,21 @@ class _HomePageState extends State<HomePage> {
                 child: ElevatedButton(
                   onPressed: _isSaving ? null : () async {
                     setSheetState(() => _isSaving = true);
-                    var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
-                    request.fields['email'] = widget.email;
-                    request.fields['profile_name'] = controller.text;
-                    if (tempImage != null) {
-                      request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
+                    try {
+                      var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
+                      request.fields['email'] = widget.email;
+                      request.fields['profile_name'] = controller.text;
+                      if (tempImage != null) {
+                        request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
+                      }
+                      var response = await request.send();
+                      if (mounted && response.statusCode == 200) {
+                        setState(() { userName = controller.text; localImage = tempImage; });
+                        Navigator.pop(context);
+                      }
+                    } finally {
+                      if (mounted) setSheetState(() => _isSaving = false);
                     }
-                    var response = await request.send();
-                    if (mounted && response.statusCode == 200) {
-                      setState(() { userName = controller.text; localImage = tempImage; });
-                      Navigator.pop(context);
-                    }
-                    if (mounted) setSheetState(() => _isSaving = false);
                   },
                   child: const Text("Save"),
                 ),
