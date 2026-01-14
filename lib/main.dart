@@ -156,6 +156,46 @@ class _HomePageState extends State<HomePage> {
   LatLng? _myCurrentPos;
   Timer? _animationTimer;
   Timer? _locationTimer;
+  double _totalDistance = 0.0; // meters
+  DateTime? _startTime;
+  LatLng? _lastRecordedPos;
+
+  double _avgSpeed = 0.0; // km/h
+  double _calories = 0.0;
+
+  void _updateDistance(LatLng newPos) {
+    if (_lastRecordedPos == null) {
+      _lastRecordedPos = newPos;
+      return;
+    }
+
+    final meters = Geolocator.distanceBetween(
+      _lastRecordedPos!.latitude,
+      _lastRecordedPos!.longitude,
+      newPos.latitude,
+      newPos.longitude,
+    );
+
+    // Ignore GPS jitter (< 4 meters)
+    if (meters < 4) return;
+
+    _totalDistance += meters;
+    _lastRecordedPos = newPos;
+  }
+  void _updateAvgSpeed() {
+    if (_startTime == null) return;
+
+    final seconds = DateTime.now().difference(_startTime!).inSeconds;
+    if (seconds == 0) return;
+
+    // meters/sec → km/h
+    _avgSpeed = (_totalDistance / seconds) * 3.6;
+  }
+  void _updateCalories({double weightKg = 60}) {
+    final km = _totalDistance / 1000;
+    _calories = km * weightKg * 1.036;
+  }
+
 
   final LatLngBounds groundBounds = LatLngBounds(
     LatLng(14.337061, 78.536599),
@@ -256,6 +296,15 @@ class _HomePageState extends State<HomePage> {
   }
 
   void startJog() async {
+    _totalDistance = 0;
+    _avgSpeed = 0;
+    _calories = 0;
+    _lastRecordedPos = null;
+    _startTime = DateTime.now();
+    var _autoFollow = true;
+    setState(() => isJogging = true);
+
+    final loc = await _determinePosition();
     try {
       final loc = await _determinePosition();
       setState(() => isJogging = true);
@@ -275,6 +324,11 @@ class _HomePageState extends State<HomePage> {
             "lat": liveLoc.latitude,
             "lng": liveLoc.longitude,
           });
+          _updateDistance(liveLoc);
+          _updateAvgSpeed();
+          _updateCalories();
+
+          setState(() {});
         } catch (e) {
           debugPrint("Live update error: $e");
         }
@@ -320,11 +374,31 @@ class _HomePageState extends State<HomePage> {
           padding: const EdgeInsets.all(16.0),
           child: Row(
             children: [
-              Expanded(child: statCard("Early Bird", "Rahul", Icons.wb_sunny, Colors.orange)),
-              const SizedBox(width: 10),
-              Expanded(child: statCard("Top Run", "8.4 km", Icons.whatshot, Colors.redAccent)),
-              const SizedBox(width: 10),
-              Expanded(child: statCard("Personal", "2.1 km", Icons.person, Colors.blueAccent)),
+              Expanded(
+                child: statCard(
+                  "Distance",
+                  "${(_totalDistance / 1000).toStringAsFixed(2)} km",
+                  Icons.route,
+                  Colors.green,
+                ),
+              ),
+              Expanded(
+                child: statCard(
+                  "Avg Speed",
+                  "${_avgSpeed.toStringAsFixed(1)} km/h",
+                  Icons.speed,
+                  Colors.blue,
+                ),
+              ),
+              Expanded(
+                child: statCard(
+                  "Calories",
+                  "${_calories.toStringAsFixed(0)} kcal",
+                  Icons.local_fire_department,
+                  Colors.orange,
+                ),
+              ),
+
             ],
           ),
         ),
