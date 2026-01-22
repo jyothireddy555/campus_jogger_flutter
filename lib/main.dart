@@ -146,6 +146,7 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
   @override
   bool get wantKeepAlive => true;
 
+  // UI and Logic State
   late String userName;
   File? localImage;
   String? remoteImageUrl;
@@ -155,31 +156,38 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
   late PageController _pageController;
   late IO.Socket socket;
 
-  // Optimized joggers list with ValueNotifier
+  // Notifiers for High Performance UI
   final ValueNotifier<List<JoggerData>> _activeJoggersNotifier = ValueNotifier([]);
-  final MapController _mapController = MapController();
-
-  // Optimized Tracking State
-  LatLng? _myCurrentPos;
-  StreamSubscription<Position>? _positionStream;
-
-  // Stats with ValueNotifiers for granular updates
+  final ValueNotifier<bool> _isInsideGround = ValueNotifier(false);
+  final ValueNotifier<double> _bearingToGround = ValueNotifier(0.0);
   final ValueNotifier<double> _totalDistance = ValueNotifier(0.0);
   final ValueNotifier<double> _avgSpeed = ValueNotifier(0.0);
   final ValueNotifier<double> _calories = ValueNotifier(0.0);
 
+  // Map and Tracking
+  final MapController _mapController = MapController();
+  LatLng? _myCurrentPos;
+  StreamSubscription<Position>? _positionStream;
+
+  // Ground Configuration
+  //static const LatLng groundCenter = LatLng(14.337488449262446, 78.53780234296367); // Center of your bounds
+  // 1. The 4 corners of your trapezium
+  static const List<LatLng> groundPolygonPoints = [
+    LatLng(14.337558643627412, 78.53617772777397),
+    LatLng(14.337096080275323, 78.53620723207409),
+    LatLng(14.33692716645528, 78.53940978968112),
+    LatLng(14.337646998317902, 78.53944465839942),
+  ];
+
+  // 2. The center point for the navigation arrow to point to
+  static const LatLng groundCenter = LatLng(14.337488449262446, 78.53780234296367);
+
+  // Math/Stat tracking
   DateTime? _startTime;
   LatLng? _lastRecordedPos;
   DateTime? _lastUpdateTime;
-
-  // Batch socket updates
   Timer? _socketBatchTimer;
   LatLng? _pendingSocketUpdate;
-
-  static final LatLngBounds groundBounds = LatLngBounds(
-    const LatLng(14.337061, 78.536599),
-    const LatLng(14.337592, 78.539344),
-  );
 
   @override
   void initState() {
@@ -190,78 +198,80 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
       remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
     }
     _initSocket();
+    _startLiveTracking(); // Start locating user immediately
   }
 
   void _initSocket() {
     socket = IO.io(AppConfig.socketUrl, IO.OptionBuilder()
         .setTransports(['websocket'])
         .disableAutoConnect()
-        .setReconnectionDelay(2000)
-        .setReconnectionDelayMax(10000)
         .build());
-
     socket.connect();
 
-    // Debounced socket handler to prevent excessive rebuilds
     socket.on("active_joggers", (data) {
       if (!mounted) return;
-
       compute(_parseJoggers, {'data': data, 'userName': userName}).then((result) {
         if (!mounted) return;
-
         _activeJoggersNotifier.value = result['joggers'];
-
-        if (result['myPos'] != null) {
-          final newPos = result['myPos'] as LatLng;
-          if (_myCurrentPos == null) {
-            setState(() => _myCurrentPos = newPos);
-          } else {
-            // Smooth interpolation instead of animation timer
-            setState(() => _myCurrentPos = newPos);
-          }
-        }
       });
     });
   }
 
   static Map<String, dynamic> _parseJoggers(Map<String, dynamic> params) {
     final data = params['data'] as List;
-    final userName = params['userName'] as String;
-
-    final joggers = data.map((j) => JoggerData(
-      name: j['name'],
-      lat: j['lat'],
-      lng: j['lng'],
-    )).toList();
-
-    final me = data.firstWhere((j) => j['name'] == userName, orElse: () => null);
-    LatLng? myPos;
-    if (me != null) {
-      myPos = LatLng(me['lat'], me['lng']);
-    }
-
-    return {'joggers': joggers, 'myPos': myPos};
+    final joggers = data.map((j) => JoggerData(name: j['name'], lat: j['lat'], lng: j['lng'])).toList();
+    return {'joggers': joggers};
   }
 
-  @override
-  void dispose() {
-    _positionStream?.cancel();
-    _socketBatchTimer?.cancel();
-    socket.dispose();
-    _pageController.dispose();
-    _activeJoggersNotifier.dispose();
-    _totalDistance.dispose();
-    _avgSpeed.dispose();
-    _calories.dispose();
-    super.dispose();
+  // CORE TRACKING LOGIC (Always running)
+  void _startLiveTracking() async {
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) return;
+    }
+
+    _positionStream = Geolocator.getPositionStream(
+      locationSettings: AndroidSettings(
+        accuracy: LocationAccuracy.best,
+        distanceFilter: 0,
+        forceLocationManager: true, // Crucial for Mock GPS
+        intervalDuration: Duration(seconds: 1),
+      ),
+    ).listen((Position position) {
+      final newPos = LatLng(position.latitude, position.longitude);
+
+      if (mounted) {
+        setState(() => _myCurrentPos = newPos);
+
+        // 1. Move camera to follow user
+        _mapController.move(newPos, _mapController.camera.zoom);
+
+        // 2. Geofencing check
+        // New check using the polygon math instead of a simple box
+        _isInsideGround.value = _isPointInPolygon(newPos, groundPolygonPoints);
+
+        // 3. Directional Math (Arrow pointing to ground)
+        if (!_isInsideGround.value) {
+          _bearingToGround.value = Geolocator.bearingBetween(
+            newPos.latitude, newPos.longitude,
+            groundCenter.latitude, groundCenter.longitude,
+          );
+        }
+
+        // 4. If currently in a session, update distance/stats
+        if (isJogging) {
+          _updateMovement(position);
+          _broadcastLocation(newPos);
+        }
+      }
+    });
   }
 
   void _updateMovement(Position pos) {
     final now = DateTime.now();
     final newPos = LatLng(pos.latitude, pos.longitude);
-
-    // Filter: Accept realistic GPS accuracy for outdoor walking
-    //if (pos.accuracy > 100) return;
+    if (pos.accuracy > 100) return;
 
     if (_lastRecordedPos == null) {
       _lastRecordedPos = newPos;
@@ -274,125 +284,79 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
       newPos.latitude, newPos.longitude,
     );
 
-    // Filter: Ignore GPS jitter (< 1 meter)
-    if (distance < 1.0) {
-      _lastUpdateTime = now;
-      return;
-    }
+    if (distance < 0.8) return;
 
-    // Filter: Speed check using milliseconds for precision
-    final milliseconds = now.difference(_lastUpdateTime!).inMilliseconds;
-    if (milliseconds > 0) {
-      final speedKmh = (distance / (milliseconds / 1000)) * 3.6;
-      // Reject unrealistic speeds (human running max ~20 km/h)
-      if (speedKmh > 20) {
+    final duration = now.difference(_lastUpdateTime!).inMilliseconds;
+    if (duration > 0) {
+      final speedKmh = (distance / (duration / 1000)) * 3.6;
+      if (speedKmh < 30) {
+        _totalDistance.value += distance;
+        _lastRecordedPos = newPos;
         _lastUpdateTime = now;
-        return;
+        _updateStats();
       }
     }
-
-    // Update stats efficiently with ValueNotifiers
-    _totalDistance.value += distance;
-    _lastRecordedPos = newPos;
-    _lastUpdateTime = now;
-    _updateStats();
   }
 
   void _updateStats() {
     if (_startTime == null) return;
     final seconds = DateTime.now().difference(_startTime!).inSeconds;
-    if (seconds > 5) {
-      _avgSpeed.value = (_totalDistance.value / seconds) * 3.6;
-    }
-    _calories.value = (_totalDistance.value / 1000) * 70 * 1.036;
+    if (seconds > 2) _avgSpeed.value = (_totalDistance.value / seconds) * 3.6;
+    _calories.value = (_totalDistance.value / 1000) * 70;
   }
 
-  void startJog() async {
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) return;
-    }
+  void _broadcastLocation(LatLng pos) {
+    _pendingSocketUpdate = pos;
+    _socketBatchTimer?.cancel();
+    _socketBatchTimer = Timer(const Duration(seconds: 1), () {
+      if (_pendingSocketUpdate != null) {
+        socket.emit("update_location", {
+          "lat": _pendingSocketUpdate!.latitude,
+          "lng": _pendingSocketUpdate!.longitude,
+        });
+        _pendingSocketUpdate = null;
+      }
+    });
+  }
 
+  void startJog() {
     setState(() {
       isJogging = true;
       _startTime = DateTime.now();
-      _lastRecordedPos = null;
+      _totalDistance.value = 0;
+      _avgSpeed.value = 0;
+      _calories.value = 0;
     });
-
-    _totalDistance.value = 0;
-    _avgSpeed.value = 0;
-    _calories.value = 0;
-
-    final current = await Geolocator.getCurrentPosition();
-    socket.emit("start_jog", {"name": userName, "lat": current.latitude, "lng": current.longitude});
-
-    // Optimized position stream with batched socket updates
-    _positionStream = Geolocator.getPositionStream(
-      locationSettings: AndroidSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 5,
-        intervalDuration: Duration(seconds: 1), // Limit update frequency
-        foregroundNotificationConfig: ForegroundNotificationConfig(
-          notificationText: "Tracking your campus activity",
-          notificationTitle: "Jogging Session Active",
-          enableWifiLock: true,
-        ),
-      ),
-    ).listen((Position position) {
-      final newPos = LatLng(position.latitude, position.longitude);
-
-      // Move map camera smoothly
-      _mapController.move(newPos, _mapController.camera.zoom);
-
-      // Update distance & calories
-      _updateMovement(position);
-
-      // Update position
-      if (_myCurrentPos == null || mounted) {
-        setState(() => _myCurrentPos = newPos);
-      }
-
-      // Batch socket updates (send every 500ms max)
-      _pendingSocketUpdate = newPos;
-      _socketBatchTimer?.cancel();
-      _socketBatchTimer = Timer(const Duration(milliseconds: 500), () {
-        if (_pendingSocketUpdate != null) {
-          socket.emit("update_location", {
-            "lat": _pendingSocketUpdate!.latitude,
-            "lng": _pendingSocketUpdate!.longitude,
-          });
-          _pendingSocketUpdate = null;
-        }
-      });
-    });
+    socket.emit("start_jog", {"name": userName, "lat": _myCurrentPos!.latitude, "lng": _myCurrentPos!.longitude});
   }
 
   void stopJog() {
     setState(() => isJogging = false);
-    _positionStream?.cancel();
-    _socketBatchTimer?.cancel();
     socket.emit("stop_jog");
   }
 
-  Widget _statCard(String title, ValueNotifier<double> valueNotifier, String Function(double) formatter, IconData icon, Color color) {
-    return ValueListenableBuilder<double>(
-      valueListenable: valueNotifier,
-      builder: (context, value, child) {
-        return Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(24),
-            boxShadow: [BoxShadow(color: color.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))],
-          ),
+  // UI COMPONENTS
+  Widget _buildGuidanceArrow() {
+    return ValueListenableBuilder2<bool, double>(
+      _isInsideGround,
+      _bearingToGround,
+      builder: (context, isInside, bearing, _) {
+        if (isInside || isJogging) return const SizedBox.shrink();
+
+        return Center(
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, color: color, size: 20),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(color: Colors.blue.withOpacity(0.8), borderRadius: BorderRadius.circular(20)),
+                child: const Text("Ground is this way! 🏃", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
               const SizedBox(height: 10),
-              Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey)),
-              Text(formatter(value), style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+              Transform.rotate(
+                angle: (bearing * (3.14159 / 180)),
+                child: const Icon(Icons.navigation, size: 60, color: Colors.blueAccent),
+              ),
             ],
           ),
         );
@@ -400,40 +364,74 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
     );
   }
 
+  Widget _statCard(String title, ValueNotifier<double> valueNotifier, String Function(double) formatter, IconData icon, Color color) {
+    return ValueListenableBuilder<double>(
+      valueListenable: valueNotifier,
+      builder: (context, value, child) {
+        return Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [BoxShadow(color: color.withOpacity(0.1), blurRadius: 10)],
+          ),
+          child: Column(
+            children: [
+              Icon(icon, color: color, size: 18),
+              const SizedBox(height: 4),
+              Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+              Text(formatter(value), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
   Widget homeContent() {
-    return Column(
+    return Stack(
       children: [
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Row(
-            children: [
-              Expanded(child: _statCard("Distance", _totalDistance, (v) => "${(v / 1000).toStringAsFixed(2)} km", Icons.route, Colors.green)),
-              Expanded(child: _statCard("Avg Speed", _avgSpeed, (v) => "${v.toStringAsFixed(1)} km/h", Icons.speed, Colors.blue)),
-              Expanded(child: _statCard("Calories", _calories, (v) => "${v.toStringAsFixed(0)} kcal", Icons.local_fire_department, Colors.orange)),
-            ],
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
-          child: Row(
-            children: [
-              const Icon(Icons.radar, color: Colors.redAccent, size: 18),
-              const SizedBox(width: 8),
-              const Text("LIVE TRACK", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-              const Spacer(),
-              ElevatedButton(
-                onPressed: isJogging ? stopJog : _showStartJogDialog,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: isJogging ? Colors.red : Colors.green,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-                ),
-                child: Text(isJogging ? "STOP" : "START"),
+        Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Row(
+                children: [
+                  Expanded(child: _statCard("Distance", _totalDistance, (v) => "${(v / 1000).toStringAsFixed(2)} km", Icons.route, Colors.green)),
+                  const SizedBox(width: 8),
+                  Expanded(child: _statCard("Speed", _avgSpeed, (v) => "${v.toStringAsFixed(1)} km/h", Icons.speed, Colors.blue)),
+                  const SizedBox(width: 8),
+                  Expanded(child: _statCard("Calories", _calories, (v) => "${v.toStringAsFixed(0)}", Icons.local_fire_department, Colors.orange)),
+                ],
               ),
-            ],
-          ),
+            ),
+            ValueListenableBuilder<bool>(
+              valueListenable: _isInsideGround,
+              builder: (context, isInside, _) {
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: (isInside || isJogging) ? (isJogging ? stopJog : startJog) : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: isJogging ? Colors.red : Colors.green,
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: Colors.grey.shade300,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      child: Text(isJogging ? "STOP SESSION" : (isInside ? "START JOGGING" : "LOCKED: ENTER GROUND")),
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            Expanded(child: _groundView()),
+          ],
         ),
-        Expanded(child: _groundView()),
+        _buildGuidanceArrow(),
       ],
     );
   }
@@ -441,153 +439,118 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
   Widget _groundView() {
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)],
-      ),
+      decoration: BoxDecoration(borderRadius: BorderRadius.circular(24), boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)]),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(24),
-        child: RepaintBoundary(
-          child: FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCameraFit: CameraFit.bounds(bounds: groundBounds, padding: const EdgeInsets.fromLTRB(60, 30, 60, 30)),
-              initialRotation: 90,
-              interactionOptions: const InteractionOptions(
-                flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag,
-              ),
+        child: FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCenter: groundCenter,
+            initialZoom: 17,
+            interactionOptions: const InteractionOptions(flags: InteractiveFlag.all),
+          ),
+          children: [
+            TileLayer(
+              urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+              userAgentPackageName: 'com.example.campusconnect',
             ),
-            children: [
-              TileLayer(
-                urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                userAgentPackageName: 'com.example.campusconnect',
-                tileProvider: NetworkTileProvider(),
-              ),
-              ValueListenableBuilder<List<JoggerData>>(
-                valueListenable: _activeJoggersNotifier,
-                builder: (context, joggers, child) {
-                  return MarkerLayer(
-                    markers: [
-                      ...joggers.where((j) => j.name != userName).map((j) => Marker(
-                        width: 36, height: 36,
-                        point: LatLng(j.lat, j.lng),
-                        child: const Icon(Icons.directions_run, color: Colors.red, size: 28),
-                      )),
-                      if (_myCurrentPos != null)
-                        Marker(
-                          width: 40, height: 40,
-                          point: _myCurrentPos!,
-                          child: const Icon(Icons.directions_run, color: Colors.blue, size: 32),
-                        ),
-                    ],
-                  );
-                },
-              ),
-            ],
-          ),
+            PolygonLayer(
+              polygons: [
+                Polygon(
+                  points: groundPolygonPoints,
+                  color: Colors.blue.withOpacity(0.2),
+                  borderColor: Colors.blueAccent,
+                  borderStrokeWidth: 3,
+                  isFilled: true,
+                ),
+              ],
+            ),
+            ValueListenableBuilder<List<JoggerData>>(
+              valueListenable: _activeJoggersNotifier,
+              builder: (context, joggers, _) {
+                return MarkerLayer(
+                  markers: [
+                    ...joggers.map((j) => Marker(
+                      point: LatLng(j.lat, j.lng),
+                      child: const Icon(Icons.directions_run, color: Colors.red, size: 28),
+                    )),
+                    if (_myCurrentPos != null)
+                      Marker(
+                        point: _myCurrentPos!,
+                        child: const Icon(Icons.person_pin_circle, color: Colors.blue, size: 40),
+                      ),
+                  ],
+                );
+              },
+            ),
+          ],
         ),
       ),
     );
   }
 
-  void _showStartJogDialog() {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text("Start Session"),
-        content: const Text("Join the ground? Your location will be shared live."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Later")),
-          ElevatedButton(onPressed: () { Navigator.pop(context); startJog(); }, child: const Text("Start")),
-        ],
-      ),
-    );
-  }
+  bool _isPointInPolygon(LatLng point, List<LatLng> polygon) {
+    var counter = 0;
+    var i = 0;
+    var xinters = 0.0;
+    var p1 = polygon[0];
+    var n = polygon.length;
 
-  void _openProfileSheet() {
-    final controller = TextEditingController(text: userName);
-    File? tempImage = localImage;
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(32))),
-      builder: (context) => StatefulBuilder(
-        builder: (context, setSheetState) => Padding(
-          padding: EdgeInsets.only(left: 24, right: 24, top: 24, bottom: MediaQuery.of(context).viewInsets.bottom + 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              GestureDetector(
-                onTap: () async {
-                  final picked = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 70, maxWidth: 512);
-                  if (picked != null) setSheetState(() => tempImage = File(picked.path));
-                },
-                child: CircleAvatar(
-                  radius: 55,
-                  backgroundImage: tempImage != null ? FileImage(tempImage!) : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
-                  child: tempImage == null && remoteImageUrl == null ? const Icon(Icons.camera_alt) : null,
-                ),
-              ),
-              const SizedBox(height: 20),
-              TextField(controller: controller, decoration: const InputDecoration(labelText: "Full Name")),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _isSaving ? null : () async {
-                    setSheetState(() => _isSaving = true);
-                    try {
-                      var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
-                      request.fields['email'] = widget.email;
-                      request.fields['profile_name'] = controller.text;
-                      if (tempImage != null) request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
-                      var response = await request.send();
-                      if (mounted && response.statusCode == 200) {
-                        setState(() { userName = controller.text; localImage = tempImage; });
-                        Navigator.pop(context);
-                      }
-                    } finally {
-                      if (mounted) setSheetState(() => _isSaving = false);
-                    }
-                  },
-                  child: const Text("Save"),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
+    for (i = 1; i <= n; i++) {
+      var p2 = polygon[i % n];
+      if (point.latitude > (p1.latitude < p2.latitude ? p1.latitude : p2.latitude)) {
+        if (point.latitude <= (p1.latitude > p2.latitude ? p1.latitude : p2.latitude)) {
+          if (point.longitude <= (p1.longitude > p2.longitude ? p1.longitude : p2.longitude)) {
+            if (p1.latitude != p2.latitude) {
+              xinters = (point.latitude - p1.latitude) * (p2.longitude - p1.longitude) / (p2.latitude - p1.latitude) + p1.longitude;
+              if (p1.longitude == p2.longitude || point.longitude <= xinters) {
+                counter++;
+              }
+            }
+          }
+        }
+      }
+      p1 = p2;
+    }
+    return counter % 2 != 0;
   }
 
   @override
-  Widget build(BuildContext context) {
-    super.build(context); // Required for AutomaticKeepAliveClientMixin
+  void dispose() {
+    _positionStream?.cancel();
+    _socketBatchTimer?.cancel();
+    socket.dispose();
+    _pageController.dispose();
+    super.dispose();
+  }
 
+  // Standard Profile/Appbar Build Methods
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
     return Scaffold(
       appBar: AppBar(
-        automaticallyImplyLeading: false,
         backgroundColor: Colors.white,
-        title: GestureDetector(
-          onTap: _openProfileSheet,
-          child: Row(
-            children: [
-              CircleAvatar(
-                radius: 20,
-                backgroundImage: localImage != null ? FileImage(localImage!) : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
-                child: localImage == null && remoteImageUrl == null ? const Icon(Icons.person) : null,
-              ),
-              const SizedBox(width: 12),
-              Text(userName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            ],
-          ),
+        elevation: 0,
+        title: Row(
+          children: [
+            CircleAvatar(
+              radius: 18,
+              backgroundImage: localImage != null ? FileImage(localImage!) : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
+              child: (localImage == null && remoteImageUrl == null) ? const Icon(Icons.person) : null,
+            ),
+            const SizedBox(width: 10),
+            Text(userName, style: const TextStyle(color: Colors.black, fontSize: 16, fontWeight: FontWeight.bold)),
+          ],
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.logout, color: Colors.redAccent), onPressed: () async {
-            await _googleSignIn.signOut();
-            if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
-          }),
+          IconButton(
+            icon: const Icon(Icons.logout, color: Colors.red),
+            onPressed: () async {
+              await _googleSignIn.signOut();
+              Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
+            },
+          ),
         ],
       ),
       body: PageView(
@@ -597,15 +560,31 @@ class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin 
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
-        onTap: (i) => _pageController.animateToPage(i, duration: const Duration(milliseconds: 300), curve: Curves.easeInOut),
+        onTap: (i) => _pageController.jumpToPage(i),
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
           BottomNavigationBarItem(icon: Icon(Icons.bar_chart), label: "Stats"),
-          BottomNavigationBarItem(icon: Icon(Icons.public), label: "Global"),
+          BottomNavigationBarItem(icon: Icon(Icons.leaderboard), label: "Global"),
         ],
       ),
     );
   }
+}
+
+// MULTI-LISTENABLE HELPER
+class ValueListenableBuilder2<A, B> extends StatelessWidget {
+  final ValueListenable<A> first;
+  final ValueListenable<B> second;
+  final Widget Function(BuildContext context, A a, B b, Widget? child) builder;
+  const ValueListenableBuilder2(this.first, this.second, {required this.builder, super.key});
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<A>(
+    valueListenable: first,
+    builder: (context, a, _) => ValueListenableBuilder<B>(
+      valueListenable: second,
+      builder: (context, b, _) => builder(context, a, b, null),
+    ),
+  );
 }
 
 // Optimized data model
