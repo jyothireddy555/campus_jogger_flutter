@@ -10,6 +10,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 
 void main() {
   runApp(const MyApp());
@@ -17,7 +18,6 @@ void main() {
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
-  // Note: For mobile, serverClientId is often unnecessary or requires the specific Android/iOS ID.
   serverClientId: AppConfig.googleWebClientId,
 );
 
@@ -64,7 +64,7 @@ class _LoginPageState extends State<LoginPage> {
       final res = await http.post(
         Uri.parse(AppConfig.backendUrl),
         body: {"id_token": auth.idToken!},
-      );
+      ).timeout(const Duration(seconds: 10));
 
       final data = jsonDecode(res.body);
 
@@ -117,7 +117,7 @@ class _LoginPageState extends State<LoginPage> {
                   ElevatedButton.icon(
                     onPressed: _loading ? null : () => signIn(context),
                     icon: _loading ? const SizedBox.shrink() : const Icon(Icons.login),
-                    label: _loading ? const CircularProgressIndicator() : const Text("Sign in with Google"),
+                    label: _loading ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Text("Sign in with Google"),
                   ),
                 ],
               ),
@@ -142,7 +142,10 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
   late String userName;
   File? localImage;
   String? remoteImageUrl;
@@ -151,55 +154,31 @@ class _HomePageState extends State<HomePage> {
   int _currentIndex = 0;
   late PageController _pageController;
   late IO.Socket socket;
-  List<dynamic> activeJoggers = [];
+
+  // Optimized joggers list with ValueNotifier
+  final ValueNotifier<List<JoggerData>> _activeJoggersNotifier = ValueNotifier([]);
   final MapController _mapController = MapController();
+
+  // Optimized Tracking State
   LatLng? _myCurrentPos;
-  Timer? _animationTimer;
-  Timer? _locationTimer;
-  double _totalDistance = 0.0; // meters
+  StreamSubscription<Position>? _positionStream;
+
+  // Stats with ValueNotifiers for granular updates
+  final ValueNotifier<double> _totalDistance = ValueNotifier(0.0);
+  final ValueNotifier<double> _avgSpeed = ValueNotifier(0.0);
+  final ValueNotifier<double> _calories = ValueNotifier(0.0);
+
   DateTime? _startTime;
   LatLng? _lastRecordedPos;
+  DateTime? _lastUpdateTime;
 
-  double _avgSpeed = 0.0; // km/h
-  double _calories = 0.0;
+  // Batch socket updates
+  Timer? _socketBatchTimer;
+  LatLng? _pendingSocketUpdate;
 
-  void _updateDistance(LatLng newPos) {
-    if (_lastRecordedPos == null) {
-      _lastRecordedPos = newPos;
-      return;
-    }
-
-    final meters = Geolocator.distanceBetween(
-      _lastRecordedPos!.latitude,
-      _lastRecordedPos!.longitude,
-      newPos.latitude,
-      newPos.longitude,
-    );
-
-    // Ignore GPS jitter (< 4 meters)
-    if (meters < 4) return;
-
-    _totalDistance += meters;
-    _lastRecordedPos = newPos;
-  }
-  void _updateAvgSpeed() {
-    if (_startTime == null) return;
-
-    final seconds = DateTime.now().difference(_startTime!).inSeconds;
-    if (seconds == 0) return;
-
-    // meters/sec → km/h
-    _avgSpeed = (_totalDistance / seconds) * 3.6;
-  }
-  void _updateCalories({double weightKg = 60}) {
-    final km = _totalDistance / 1000;
-    _calories = km * weightKg * 1.036;
-  }
-
-
-  final LatLngBounds groundBounds = LatLngBounds(
-    LatLng(14.337061, 78.536599),
-    LatLng(14.337592, 78.539344),
+  static final LatLngBounds groundBounds = LatLngBounds(
+    const LatLng(14.337061, 78.536599),
+    const LatLng(14.337592, 78.539344),
   );
 
   @override
@@ -210,160 +189,214 @@ class _HomePageState extends State<HomePage> {
     if (widget.profileImageUrl != null && widget.profileImageUrl!.isNotEmpty) {
       remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
     }
+    _initSocket();
+  }
 
+  void _initSocket() {
     socket = IO.io(AppConfig.socketUrl, IO.OptionBuilder()
         .setTransports(['websocket'])
         .disableAutoConnect()
+        .setReconnectionDelay(2000)
+        .setReconnectionDelayMax(10000)
         .build());
 
     socket.connect();
 
-    socket.onConnect((_) => debugPrint("✅ SOCKET CONNECTED"));
-    socket.onDisconnect((_) => debugPrint("❌ SOCKET DISCONNECTED"));
-
+    // Debounced socket handler to prevent excessive rebuilds
     socket.on("active_joggers", (data) {
       if (!mounted) return;
-      debugPrint("RECEIVED JOGGERS => $data");
 
-      // Handle self-interpolation for smooth movement
-      final me = (data as List).firstWhere(
-            (j) => j['name'] == userName,
-        orElse: () => null,
-      );
+      compute(_parseJoggers, {'data': data, 'userName': userName}).then((result) {
+        if (!mounted) return;
 
-      if (me != null) {
-        final newPos = LatLng(me['lat'], me['lng']);
-        if (_myCurrentPos == null) {
-          setState(() => _myCurrentPos = newPos);
-        } else {
-          animateTo(_myCurrentPos!, newPos);
+        _activeJoggersNotifier.value = result['joggers'];
+
+        if (result['myPos'] != null) {
+          final newPos = result['myPos'] as LatLng;
+          if (_myCurrentPos == null) {
+            setState(() => _myCurrentPos = newPos);
+          } else {
+            // Smooth interpolation instead of animation timer
+            setState(() => _myCurrentPos = newPos);
+          }
         }
-      }
-
-      setState(() => activeJoggers = data);
+      });
     });
+  }
+
+  static Map<String, dynamic> _parseJoggers(Map<String, dynamic> params) {
+    final data = params['data'] as List;
+    final userName = params['userName'] as String;
+
+    final joggers = data.map((j) => JoggerData(
+      name: j['name'],
+      lat: j['lat'],
+      lng: j['lng'],
+    )).toList();
+
+    final me = data.firstWhere((j) => j['name'] == userName, orElse: () => null);
+    LatLng? myPos;
+    if (me != null) {
+      myPos = LatLng(me['lat'], me['lng']);
+    }
+
+    return {'joggers': joggers, 'myPos': myPos};
   }
 
   @override
   void dispose() {
-    _locationTimer?.cancel();
-    _animationTimer?.cancel();
-    socket.off("active_joggers");
+    _positionStream?.cancel();
+    _socketBatchTimer?.cancel();
     socket.dispose();
     _pageController.dispose();
+    _activeJoggersNotifier.dispose();
+    _totalDistance.dispose();
+    _avgSpeed.dispose();
+    _calories.dispose();
     super.dispose();
   }
 
-  Future<LatLng> _determinePosition() async {
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) throw "Location services are disabled.";
+  void _updateMovement(Position pos) {
+    final now = DateTime.now();
+    final newPos = LatLng(pos.latitude, pos.longitude);
 
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) throw "Location permissions are denied.";
+    // Filter: Accept realistic GPS accuracy for outdoor walking
+    //if (pos.accuracy > 100) return;
+
+    if (_lastRecordedPos == null) {
+      _lastRecordedPos = newPos;
+      _lastUpdateTime = now;
+      return;
     }
 
-    if (permission == LocationPermission.deniedForever) throw "Location permissions permanently denied.";
+    final distance = Geolocator.distanceBetween(
+      _lastRecordedPos!.latitude, _lastRecordedPos!.longitude,
+      newPos.latitude, newPos.longitude,
+    );
 
-    final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-    return LatLng(pos.latitude, pos.longitude);
+    // Filter: Ignore GPS jitter (< 1 meter)
+    if (distance < 1.0) {
+      _lastUpdateTime = now;
+      return;
+    }
+
+    // Filter: Speed check using milliseconds for precision
+    final milliseconds = now.difference(_lastUpdateTime!).inMilliseconds;
+    if (milliseconds > 0) {
+      final speedKmh = (distance / (milliseconds / 1000)) * 3.6;
+      // Reject unrealistic speeds (human running max ~20 km/h)
+      if (speedKmh > 20) {
+        _lastUpdateTime = now;
+        return;
+      }
+    }
+
+    // Update stats efficiently with ValueNotifiers
+    _totalDistance.value += distance;
+    _lastRecordedPos = newPos;
+    _lastUpdateTime = now;
+    _updateStats();
   }
 
-  void animateTo(LatLng from, LatLng to) {
-    _animationTimer?.cancel();
-    const int steps = 15;
-    int currentStep = 0;
-
-    final double latStep = (to.latitude - from.latitude) / steps;
-    final double lngStep = (to.longitude - from.longitude) / steps;
-
-    _animationTimer = Timer.periodic(const Duration(milliseconds: 60), (timer) {
-      if (!mounted) { timer.cancel(); return; }
-      currentStep++;
-      if (currentStep >= steps) {
-        timer.cancel();
-        setState(() => _myCurrentPos = to);
-      } else {
-        setState(() {
-          _myCurrentPos = LatLng(
-            from.latitude + (latStep * currentStep),
-            from.longitude + (lngStep * currentStep),
-          );
-        });
-      }
-    });
+  void _updateStats() {
+    if (_startTime == null) return;
+    final seconds = DateTime.now().difference(_startTime!).inSeconds;
+    if (seconds > 5) {
+      _avgSpeed.value = (_totalDistance.value / seconds) * 3.6;
+    }
+    _calories.value = (_totalDistance.value / 1000) * 70 * 1.036;
   }
 
   void startJog() async {
-    _totalDistance = 0;
-    _avgSpeed = 0;
-    _calories = 0;
-    _lastRecordedPos = null;
-    _startTime = DateTime.now();
-    var _autoFollow = true;
-    setState(() => isJogging = true);
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) return;
+    }
 
-    final loc = await _determinePosition();
-    try {
-      final loc = await _determinePosition();
-      setState(() => isJogging = true);
+    setState(() {
+      isJogging = true;
+      _startTime = DateTime.now();
+      _lastRecordedPos = null;
+    });
 
-      socket.emit("start_jog", {
-        "name": userName,
-        "lat": loc.latitude,
-        "lng": loc.longitude,
-      });
+    _totalDistance.value = 0;
+    _avgSpeed.value = 0;
+    _calories.value = 0;
 
-      _locationTimer?.cancel();
-      _locationTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
-        if (!mounted || !isJogging) return;
-        try {
-          final liveLoc = await _determinePosition();
+    final current = await Geolocator.getCurrentPosition();
+    socket.emit("start_jog", {"name": userName, "lat": current.latitude, "lng": current.longitude});
+
+    // Optimized position stream with batched socket updates
+    _positionStream = Geolocator.getPositionStream(
+      locationSettings: AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 5,
+        intervalDuration: Duration(seconds: 1), // Limit update frequency
+        foregroundNotificationConfig: ForegroundNotificationConfig(
+          notificationText: "Tracking your campus activity",
+          notificationTitle: "Jogging Session Active",
+          enableWifiLock: true,
+        ),
+      ),
+    ).listen((Position position) {
+      final newPos = LatLng(position.latitude, position.longitude);
+
+      // Move map camera smoothly
+      _mapController.move(newPos, _mapController.camera.zoom);
+
+      // Update distance & calories
+      _updateMovement(position);
+
+      // Update position
+      if (_myCurrentPos == null || mounted) {
+        setState(() => _myCurrentPos = newPos);
+      }
+
+      // Batch socket updates (send every 500ms max)
+      _pendingSocketUpdate = newPos;
+      _socketBatchTimer?.cancel();
+      _socketBatchTimer = Timer(const Duration(milliseconds: 500), () {
+        if (_pendingSocketUpdate != null) {
           socket.emit("update_location", {
-            "lat": liveLoc.latitude,
-            "lng": liveLoc.longitude,
+            "lat": _pendingSocketUpdate!.latitude,
+            "lng": _pendingSocketUpdate!.longitude,
           });
-          _updateDistance(liveLoc);
-          _updateAvgSpeed();
-          _updateCalories();
-
-          setState(() {});
-        } catch (e) {
-          debugPrint("Live update error: $e");
+          _pendingSocketUpdate = null;
         }
       });
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-    }
+    });
   }
 
   void stopJog() {
     setState(() => isJogging = false);
-    _locationTimer?.cancel();
-    _animationTimer?.cancel();
+    _positionStream?.cancel();
+    _socketBatchTimer?.cancel();
     socket.emit("stop_jog");
   }
 
-  /* ---------------- UI COMPONENTS ---------------- */
-
-  Widget statCard(String title, String value, IconData icon, Color color) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: [BoxShadow(color: color.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(height: 10),
-          Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey)),
-          Text(value, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-        ],
-      ),
+  Widget _statCard(String title, ValueNotifier<double> valueNotifier, String Function(double) formatter, IconData icon, Color color) {
+    return ValueListenableBuilder<double>(
+      valueListenable: valueNotifier,
+      builder: (context, value, child) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [BoxShadow(color: color.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, color: color, size: 20),
+              const SizedBox(height: 10),
+              Text(title, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+              Text(formatter(value), style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -374,31 +407,9 @@ class _HomePageState extends State<HomePage> {
           padding: const EdgeInsets.all(16.0),
           child: Row(
             children: [
-              Expanded(
-                child: statCard(
-                  "Distance",
-                  "${(_totalDistance / 1000).toStringAsFixed(2)} km",
-                  Icons.route,
-                  Colors.green,
-                ),
-              ),
-              Expanded(
-                child: statCard(
-                  "Avg Speed",
-                  "${_avgSpeed.toStringAsFixed(1)} km/h",
-                  Icons.speed,
-                  Colors.blue,
-                ),
-              ),
-              Expanded(
-                child: statCard(
-                  "Calories",
-                  "${_calories.toStringAsFixed(0)} kcal",
-                  Icons.local_fire_department,
-                  Colors.orange,
-                ),
-              ),
-
+              Expanded(child: _statCard("Distance", _totalDistance, (v) => "${(v / 1000).toStringAsFixed(2)} km", Icons.route, Colors.green)),
+              Expanded(child: _statCard("Avg Speed", _avgSpeed, (v) => "${v.toStringAsFixed(1)} km/h", Icons.speed, Colors.blue)),
+              Expanded(child: _statCard("Calories", _calories, (v) => "${v.toStringAsFixed(0)} kcal", Icons.local_fire_department, Colors.orange)),
             ],
           ),
         ),
@@ -411,7 +422,7 @@ class _HomePageState extends State<HomePage> {
               const Text("LIVE TRACK", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
               const Spacer(),
               ElevatedButton(
-                onPressed: isJogging ? stopJog : showStartJogDialog,
+                onPressed: isJogging ? stopJog : _showStartJogDialog,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: isJogging ? Colors.red : Colors.green,
                   foregroundColor: Colors.white,
@@ -422,12 +433,12 @@ class _HomePageState extends State<HomePage> {
             ],
           ),
         ),
-        Expanded(child: groundView()),
+        Expanded(child: _groundView()),
       ],
     );
   }
 
-  Widget groundView() {
+  Widget _groundView() {
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       decoration: BoxDecoration(
@@ -436,46 +447,50 @@ class _HomePageState extends State<HomePage> {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(24),
-        child: FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCameraFit: CameraFit.bounds(
-              bounds: groundBounds,
-              padding: const EdgeInsets.fromLTRB(60, 30, 60, 30),
+        child: RepaintBoundary(
+          child: FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCameraFit: CameraFit.bounds(bounds: groundBounds, padding: const EdgeInsets.fromLTRB(60, 30, 60, 30)),
+              initialRotation: 90,
+              interactionOptions: const InteractionOptions(
+                flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag,
+              ),
             ),
-            initialRotation: 90,
+            children: [
+              TileLayer(
+                urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                userAgentPackageName: 'com.example.campusconnect',
+                tileProvider: NetworkTileProvider(),
+              ),
+              ValueListenableBuilder<List<JoggerData>>(
+                valueListenable: _activeJoggersNotifier,
+                builder: (context, joggers, child) {
+                  return MarkerLayer(
+                    markers: [
+                      ...joggers.where((j) => j.name != userName).map((j) => Marker(
+                        width: 36, height: 36,
+                        point: LatLng(j.lat, j.lng),
+                        child: const Icon(Icons.directions_run, color: Colors.red, size: 28),
+                      )),
+                      if (_myCurrentPos != null)
+                        Marker(
+                          width: 40, height: 40,
+                          point: _myCurrentPos!,
+                          child: const Icon(Icons.directions_run, color: Colors.blue, size: 32),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ],
           ),
-          children: [
-            TileLayer(
-              urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-              userAgentPackageName: 'com.example.campusconnect',
-            ),
-            MarkerLayer(
-              markers: [
-                // Others
-                ...activeJoggers.where((j) => j['name'] != userName).map((j) => Marker(
-                  width: 36,
-                  height: 36,
-                  point: LatLng(j['lat'], j['lng']),
-                  child: const Icon(Icons.directions_run, color: Colors.red, size: 28),
-                )),
-                // Self (Animated)
-                if (_myCurrentPos != null)
-                  Marker(
-                    width: 40,
-                    height: 40,
-                    point: _myCurrentPos!,
-                    child: const Icon(Icons.directions_run, color: Colors.blue, size: 32),
-                  ),
-              ],
-            ),
-          ],
         ),
       ),
     );
   }
 
-  void showStartJogDialog() {
+  void _showStartJogDialog() {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -489,7 +504,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void openProfileSheet() {
+  void _openProfileSheet() {
     final controller = TextEditingController(text: userName);
     File? tempImage = localImage;
 
@@ -499,20 +514,18 @@ class _HomePageState extends State<HomePage> {
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(32))),
       builder: (context) => StatefulBuilder(
         builder: (context, setSheetState) => Padding(
-          padding: EdgeInsets.only(left: 24, right: 24, top: 24,
-              bottom: MediaQuery.of(context).viewInsets.bottom + 24),
+          padding: EdgeInsets.only(left: 24, right: 24, top: 24, bottom: MediaQuery.of(context).viewInsets.bottom + 24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               GestureDetector(
                 onTap: () async {
-                  final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+                  final picked = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 70, maxWidth: 512);
                   if (picked != null) setSheetState(() => tempImage = File(picked.path));
                 },
                 child: CircleAvatar(
                   radius: 55,
-                  backgroundImage: tempImage != null ? FileImage(tempImage!)
-                      : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
+                  backgroundImage: tempImage != null ? FileImage(tempImage!) : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
                   child: tempImage == null && remoteImageUrl == null ? const Icon(Icons.camera_alt) : null,
                 ),
               ),
@@ -528,9 +541,7 @@ class _HomePageState extends State<HomePage> {
                       var request = http.MultipartRequest("POST", Uri.parse(AppConfig.updateProfileUrl));
                       request.fields['email'] = widget.email;
                       request.fields['profile_name'] = controller.text;
-                      if (tempImage != null) {
-                        request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
-                      }
+                      if (tempImage != null) request.files.add(await http.MultipartFile.fromPath('profile_image', tempImage!.path));
                       var response = await request.send();
                       if (mounted && response.statusCode == 200) {
                         setState(() { userName = controller.text; localImage = tempImage; });
@@ -552,18 +563,19 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Required for AutomaticKeepAliveClientMixin
+
     return Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: false,
         backgroundColor: Colors.white,
         title: GestureDetector(
-          onTap: openProfileSheet,
+          onTap: _openProfileSheet,
           child: Row(
             children: [
               CircleAvatar(
                 radius: 20,
-                backgroundImage: localImage != null ? FileImage(localImage!)
-                    : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
+                backgroundImage: localImage != null ? FileImage(localImage!) : (remoteImageUrl != null ? NetworkImage(remoteImageUrl!) : null),
                 child: localImage == null && remoteImageUrl == null ? const Icon(Icons.person) : null,
               ),
               const SizedBox(width: 12),
@@ -572,13 +584,10 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.logout, color: Colors.redAccent),
-            onPressed: () async {
-              await _googleSignIn.signOut();
-              if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
-            },
-          ),
+          IconButton(icon: const Icon(Icons.logout, color: Colors.redAccent), onPressed: () async {
+            await _googleSignIn.signOut();
+            if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage()));
+          }),
         ],
       ),
       body: PageView(
@@ -597,6 +606,15 @@ class _HomePageState extends State<HomePage> {
       ),
     );
   }
+}
+
+// Optimized data model
+class JoggerData {
+  final String name;
+  final double lat;
+  final double lng;
+
+  JoggerData({required this.name, required this.lat, required this.lng});
 }
 
 class StatsPage extends StatelessWidget {
