@@ -35,6 +35,8 @@ dependencies:
   image_picker: ^1.0.7
   socket_io_client: ^2.0.3
   google_maps_flutter: ^2.6.0
+  shared_preferences: ^2.2.2
+  fl_chart: ^0.66.0
 
 
 
