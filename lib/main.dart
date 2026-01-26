@@ -434,8 +434,10 @@ class _HomePageState extends State<HomePage>
 
     _socket.on("active_joggers", (data) {
       if (!mounted) return;
-      compute(_parseJoggers, {'data': data, 'userName': _userName})
-          .then((result) {
+      compute(_parseJoggers, {
+        'data': data,
+        'userId': widget.userId,
+      }).then((result) {
         if (!mounted) return;
         _activeJoggersNotifier.value = result['joggers'];
       });
@@ -443,19 +445,22 @@ class _HomePageState extends State<HomePage>
   }
 
   static Map<String, dynamic> _parseJoggers(Map<String, dynamic> params) {
-    final data = params['data'] as List;
+    final List data = params['data'];
+    final int myId = params['userId'];
 
-    final joggers = data.map((j) {
-      return JoggerData(
-        name: j['name'],
-        lat: j['lat'],
-        lng: j['lng'],
-        profileImage: j['profile_image'],
-      );
-    }).toList();
+    final joggers = data
+        .where((j) => j['user_id'] != myId) // 👈 REMOVE YOURSELF
+        .map((j) => JoggerData(
+      name: j['name'],
+      lat: j['lat'],
+      lng: j['lng'],
+      profileImage: j['profile_image'],
+    ))
+        .toList();
 
     return {'joggers': joggers};
   }
+
 
 
   Future<void> _loadUserWeight() async {
@@ -1179,7 +1184,10 @@ class _HomePageState extends State<HomePage>
           },
         ),
         // Directional arrow
-        const Icon(Icons.navigation, color: Colors.blue, size: 28),
+        Transform.rotate(
+          angle: _bearingToGround.value * (3.14159 / 180),
+          child: const Icon(Icons.navigation, color: Colors.blue, size: 28),
+        ),
         // Solid center dot
         Container(
           width: 12,
