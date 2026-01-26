@@ -14,10 +14,35 @@ import 'package:geolocator/geolocator.dart';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 
 void main() {
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'jogger_tracking',
+      channelName: 'Jogging Tracker',
+      channelDescription: 'Tracks your jogging activity',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: true,
+      playSound: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.repeat(5000),
+      autoRunOnBoot: false,
+      allowWakeLock: true,
+      allowWifiLock: false,
+    ),
+  );
+
   runApp(const MyApp());
 }
+
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
@@ -36,7 +61,73 @@ class MyApp extends StatelessWidget {
         colorSchemeSeed: Colors.blue,
         brightness: Brightness.light,
       ),
-      home: const LoginPage(),
+      home: const SplashDecider(),
+    );
+  }
+}
+//for the auto open if the user already loged  in
+class SplashDecider extends StatefulWidget {
+  const SplashDecider({super.key});
+
+  @override
+  State<SplashDecider> createState() => _SplashDeciderState();
+}
+
+class _SplashDeciderState extends State<SplashDecider> {
+  @override
+  void initState() {
+    super.initState();
+    _decide();
+  }
+
+  Future<void> _decide() async {
+    final prefs = await SharedPreferences.getInstance();
+    final loggedIn = prefs.getBool("is_logged_in") ?? false;
+
+    if (!mounted) return;
+
+    if (!loggedIn) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginPage()),
+      );
+      return;
+    }
+
+    final email = prefs.getString("email")!;
+    final profileDone = prefs.getBool("profile_done_$email") ?? false;
+
+    if (!profileDone) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => UserDetailsPage(
+            userEmail: email,
+            userId: prefs.getInt("user_id")!,
+            userName: prefs.getString("name")!,
+            profileImageUrl: prefs.getString("profile_image"),
+          ),
+        ),
+      );
+    } else {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => HomePage(
+            userId: prefs.getInt("user_id")!,
+            email: email,
+            name: prefs.getString("name")!,
+            profileImageUrl: prefs.getString("profile_image"),
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(child: CircularProgressIndicator()),
     );
   }
 }
@@ -72,7 +163,16 @@ class _LoginPageState extends State<LoginPage> {
       final data = jsonDecode(res.body);
 
       if (data["status"] == "success") {
+        final prefs = await SharedPreferences.getInstance();
+
+        await prefs.setBool("is_logged_in", true);
+        await prefs.setInt("user_id", data["user_id"]);
+        await prefs.setString("email", data["email"]);
+        await prefs.setString("name", data["name"]);
+        await prefs.setString("profile_image", data["profile_image"] ?? "");
+
         if (!mounted) return;
+
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
@@ -84,7 +184,8 @@ class _LoginPageState extends State<LoginPage> {
             ),
           ),
         );
-      } else {
+      }
+      else {
         throw Exception("Backend login failed");
       }
     } catch (e) {
@@ -176,7 +277,7 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage>
-    with AutomaticKeepAliveClientMixin {
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   @override
   bool get wantKeepAlive => true;
 
@@ -217,6 +318,8 @@ class _HomePageState extends State<HomePage>
   final ValueNotifier<double> _totalDistance = ValueNotifier(0.0);
   final ValueNotifier<double> _avgSpeed = ValueNotifier(0.0);
   final ValueNotifier<double> _calories = ValueNotifier(0.0);
+  final ValueNotifier<double> _todayKm = ValueNotifier(0.0);
+  final ValueNotifier<int> _streak = ValueNotifier(0);
 
   // Map and Location
   final MapController _mapController = MapController();
@@ -229,16 +332,87 @@ class _HomePageState extends State<HomePage>
   DateTime? _lastUpdateTime;
   Timer? _socketBatchTimer;
   LatLng? _pendingSocketUpdate;
+  Timer? _notificationUpdateTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _userName = widget.name;
     _pageController = PageController(initialPage: _currentIndex);
     _initializeProfileImage();
     _initSocket();
+    _requestPermissions();
     _startLiveTracking();
     _loadUserWeight();
+    _fetchStreak();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // App lifecycle doesn't affect tracking when foreground service is active
+    debugPrint("App state: $state");
+  }
+
+  Future<void> _requestPermissions() async {
+    // Request location permission
+    final locationStatus = await Permission.location.request();
+
+    if (locationStatus.isGranted) {
+      // Request background location for Android 10+
+      if (Platform.isAndroid) {
+        final bgLocationStatus = await Permission.locationAlways.request();
+        if (!bgLocationStatus.isGranted) {
+          _showPermissionDialog();
+        }
+      }
+    }
+
+    // Request battery optimization exemption
+    if (Platform.isAndroid) {
+      await Permission.ignoreBatteryOptimizations.request();
+    }
+  }
+
+  Future<void> _fetchStreak() async {
+    try {
+      final res = await http.get(
+        Uri.parse(
+          "${AppConfig.apiBase}/get_streak.php?user_id=${widget.userId}",
+        ),
+      );
+
+      final data = jsonDecode(res.body);
+
+      _streak.value = data['current_streak'] ?? 0;
+      _todayKm.value = (data['today_km'] ?? 0).toDouble();
+    } catch (_) {}
+  }
+
+
+  void _showPermissionDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Background Location"),
+        content: const Text(
+          "For accurate tracking when the screen is off, please grant 'Allow all the time' location permission in Settings.",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Later"),
+          ),
+          TextButton(
+            onPressed: () {
+              openAppSettings();
+              Navigator.pop(context);
+            },
+            child: const Text("Open Settings"),
+          ),
+        ],
+      ),
+    );
   }
 
   void _initializeProfileImage() {
@@ -357,6 +531,7 @@ class _HomePageState extends State<HomePage>
       final speedKmh = (distance / (duration / 1000)) * 3.6;
       if (speedKmh < _maxSpeedKmh) {
         _totalDistance.value += distance;
+        _todayKm.value = _totalDistance.value / 1000;
         _lastRecordedPos = newPos;
         _lastUpdateTime = now;
         _updateStats();
@@ -398,7 +573,43 @@ class _HomePageState extends State<HomePage>
     });
   }
 
-  void _startJog() {
+  Future<void> _startForegroundService() async {
+    if (await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.restartService();
+    } else {
+      await FlutterForegroundTask.startService(
+        notificationTitle: 'Campus Connect - Jogging',
+        notificationText: 'Tracking your run...',
+        callback: startCallback,
+      );
+    }
+
+    // Start periodic notification updates
+    _notificationUpdateTimer = Timer.periodic(
+      const Duration(seconds: 5),
+          (_) => _updateNotification(),
+    );
+  }
+
+  void _updateNotification() {
+    if (!_isJogging) return;
+
+    final distKm = (_totalDistance.value / 1000).toStringAsFixed(2);
+    final speed = _avgSpeed.value.toStringAsFixed(1);
+    final cals = _calories.value.toStringAsFixed(0);
+
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'Campus Connect - Jogging 🏃',
+      notificationText: '$distKm km • $speed km/h • $cals cal',
+    );
+  }
+
+  Future<void> _stopForegroundService() async {
+    _notificationUpdateTimer?.cancel();
+    await FlutterForegroundTask.stopService();
+  }
+
+  void _startJog() async {
     // Safety check: ensure GPS has locked position
     if (_myCurrentPos == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -409,6 +620,12 @@ class _HomePageState extends State<HomePage>
       );
       return;
     }
+
+    // Enable wake lock to prevent CPU sleep
+    await WakelockPlus.enable();
+
+    // Start foreground service
+    await _startForegroundService();
 
     setState(() {
       _isJogging = true;
@@ -430,6 +647,12 @@ class _HomePageState extends State<HomePage>
 
   void _stopJog() async {
     setState(() => _isJogging = false);
+
+    // Disable wake lock
+    await WakelockPlus.disable();
+
+    // Stop foreground service
+    await _stopForegroundService();
 
     try {
       if (_startTime == null) return;
@@ -482,6 +705,7 @@ class _HomePageState extends State<HomePage>
     _lastRecordedPos = null;
     _lastUpdateTime = null;
     _startTime = null;
+    _fetchStreak(); // 🔄 refresh streak & progress
   }
 
   double _getMET(double speedKmh) {
@@ -715,6 +939,7 @@ class _HomePageState extends State<HomePage>
       children: [
         Column(
           children: [
+            _buildStreakCard(),
             Padding(
               padding: const EdgeInsets.all(12.0),
               child: Row(
@@ -859,10 +1084,85 @@ class _HomePageState extends State<HomePage>
     );
   }
 
+  Widget _buildStreakCard() {
+    return ValueListenableBuilder2<double, int>(
+      _todayKm,
+      _streak,
+      builder: (context, km, streak, _) {
+        final progress = (km / 0.6).clamp(0.0, 1.0);
+        final remaining = (0.6 - km).clamp(0.0, 0.6);
+
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 16, 16, 10),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              colors: [Color(0xFFFF8C00), Color(0xFFFF4500)],
+            ),
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.orange.withOpacity(0.3),
+                blurRadius: 12,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.local_fire_department,
+                      color: Colors.white, size: 28),
+                  const SizedBox(width: 10),
+                  Text(
+                    "$streak-day streak",
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 12),
+
+              LinearProgressIndicator(
+                value: progress,
+                minHeight: 8,
+                backgroundColor: Colors.white.withOpacity(0.3),
+                valueColor:
+                const AlwaysStoppedAnimation<Color>(Colors.white),
+              ),
+
+              const SizedBox(height: 8),
+
+              Text(
+                km >= 0.6 //it is the daily base distance to walk or jog
+                    ? "🔥 Streak saved for today!"
+                    : "Walk ${(remaining * 1000).toInt()}m more to keep streak",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _positionStream?.cancel();
     _socketBatchTimer?.cancel();
+    _notificationUpdateTimer?.cancel();
     _socket.dispose();
     _pageController.dispose();
     _activeJoggersNotifier.dispose();
@@ -871,6 +1171,8 @@ class _HomePageState extends State<HomePage>
     _totalDistance.dispose();
     _avgSpeed.dispose();
     _calories.dispose();
+    WakelockPlus.disable();
+    FlutterForegroundTask.stopService();
     super.dispose();
   }
 
@@ -912,7 +1214,10 @@ class _HomePageState extends State<HomePage>
           IconButton(
             icon: const Icon(Icons.logout, color: Colors.red),
             onPressed: () async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.clear(); // 👈 THIS IS THE FIX
               await _googleSignIn.signOut();
+
               if (mounted) {
                 Navigator.pushReplacement(
                   context,
@@ -947,6 +1252,33 @@ class _HomePageState extends State<HomePage>
     );
   }
 }
+
+// Foreground task callback
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(JoggerTaskHandler());
+}
+
+class JoggerTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    // Foreground service started
+  }
+
+  @override
+  Future<void> onRepeatEvent(DateTime timestamp) async {
+    FlutterForegroundTask.updateService(
+      notificationText: 'Tracking jogging session...',
+    );
+  }
+
+  @override
+  Future<void> onDestroy(DateTime timestamp) async {
+    // Foreground service stopped
+  }
+}
+
+
 
 /* ========================= HELPER WIDGETS ========================= */
 
@@ -1379,36 +1711,179 @@ class _StatsPageState extends State<StatsPage>
 }
 
 /* ========================= LEADERBOARD ========================= */
-
-class AllStatsPage extends StatelessWidget {
+class AllStatsPage extends StatefulWidget {
   const AllStatsPage({super.key});
 
   @override
+  State<AllStatsPage> createState() => _AllStatsPageState();
+}
+
+class _AllStatsPageState extends State<AllStatsPage> with SingleTickerProviderStateMixin {
+  late Future<Map<String, dynamic>> _globalStatsFuture;
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _globalStatsFuture = _fetchGlobalStats();
+    _tabController = TabController(length: 3, vsync: this);
+  }
+
+  Future<Map<String, dynamic>> _fetchGlobalStats() async {
+    final res = await http.get(
+      Uri.parse("${AppConfig.apiBase}/get_global_stats.php"),
+    ).timeout(const Duration(seconds: 10));
+    return jsonDecode(res.body);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: const [
-          Icon(Icons.emoji_events, size: 80, color: Colors.amber),
-          SizedBox(height: 20),
-          Text(
-            "Leaderboard",
-            style: TextStyle(
-              fontSize: 28,
-              fontWeight: FontWeight.bold,
-              color: Colors.black87,
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F9FE),
+      body: FutureBuilder<Map<String, dynamic>>(
+        future: _globalStatsFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (!snapshot.hasData || snapshot.data!['status'] != 'success') {
+            return const Center(child: Text("Failed to load global stats"));
+          }
+
+          final data = snapshot.data!;
+
+          return RefreshIndicator(
+            onRefresh: () async {
+              setState(() { _globalStatsFuture = _fetchGlobalStats(); });
+            },
+            child: CustomScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              slivers: [
+                SliverToBoxAdapter(
+                  child: _buildHeader(
+                    data['total_km_today']?.toDouble() ?? 0.0,
+                    data['active_users_today']?.toInt() ?? 0,
+                  ),
+                ),
+                SliverAppBar(
+                  pinned: true,
+                  backgroundColor: const Color(0xFFF8F9FE),
+                  automaticallyImplyLeading: false,
+                  elevation: 0,
+                  toolbarHeight: 0,
+                  bottom: TabBar(
+                    controller: _tabController,
+                    indicatorColor: Colors.blueAccent,
+                    labelColor: Colors.blueAccent,
+                    unselectedLabelColor: Colors.grey,
+                    tabs: const [
+                      Tab(text: "Today"),
+                      Tab(text: "Streaks"),
+                      Tab(text: "Weekly"),
+                    ],
+                  ),
+                ),
+                SliverFillRemaining(
+                  child: TabBarView(
+                    controller: _tabController,
+                    children: [
+                      _buildLeaderboardList(data['today_leaderboard'], "km"),
+                      _buildLeaderboardList(data['top_streaks'], "days"),
+                      _buildLeaderboardList(data['weekly_leaderboard'], "km"),
+                    ],
+                  ),
+                ),
+              ],
             ),
-          ),
-          SizedBox(height: 12),
-          Text(
-            "Coming Soon!",
-            style: TextStyle(
-              fontSize: 16,
-              color: Colors.grey,
-            ),
-          ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildHeader(double totalKm, int activeUsers) {
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: const LinearGradient(colors: [Color(0xFF4158D0), Color(0xFFC850C0)]),
+        boxShadow: [BoxShadow(color: Colors.purple.withOpacity(0.3), blurRadius: 20, offset: const Offset(0, 10))],
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          _headerStat("Total Distance", "$totalKm", "KM"),
+          Container(width: 1, height: 40, color: Colors.white24),
+          _headerStat("Active Now", "$activeUsers", "RUNNERS"),
         ],
       ),
     );
+  }
+
+  Widget _headerStat(String label, String value, String unit) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.baseline,
+          textBaseline: TextBaseline.alphabetic,
+          children: [
+            Text(value, style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+            const SizedBox(width: 4),
+            Text(unit, style: const TextStyle(color: Colors.white, fontSize: 12)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLeaderboardList(List list, String unit) {
+    if (list.isEmpty) return const Center(child: Text("No records yet"));
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      itemCount: list.length,
+      itemBuilder: (context, index) {
+        final item = list[index];
+        final val = item['distance_km'] ?? item['streak'] ?? item['total_km'] ?? 0;
+        final isTopThree = index < 3;
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10)],
+          ),
+          child: ListTile(
+            leading: _buildRankBadge(index + 1),
+            title: Text(item['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: index == 0 ? const Text("🏆 Current Leader", style: TextStyle(color: Colors.orange, fontSize: 11)) : null,
+            trailing: Text("$val $unit", style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: isTopThree ? Colors.blueAccent : Colors.black87,
+                fontSize: 16
+            )),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRankBadge(int rank) {
+    if (rank == 1) return const CircleAvatar(backgroundColor: Color(0xFFFFD700), child: Icon(Icons.star, color: Colors.white));
+    if (rank == 2) return const CircleAvatar(backgroundColor: Color(0xFFC0C0C0), child: Icon(Icons.looks_two, color: Colors.white));
+    if (rank == 3) return const CircleAvatar(backgroundColor: Color(0xFFCD7F32), child: Icon(Icons.looks_3, color: Colors.white));
+    return CircleAvatar(
+      backgroundColor: Colors.grey.shade100,
+      child: Text("$rank", style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+    );
+  }
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
   }
 }
