@@ -17,7 +17,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
-
+import 'dart:isolate';
 
 void main() {
   FlutterForegroundTask.init(
@@ -32,8 +32,9 @@ void main() {
       showNotification: true,
       playSound: false,
     ),
-    foregroundTaskOptions: ForegroundTaskOptions(
-      eventAction: ForegroundTaskEventAction.repeat(5000),
+    foregroundTaskOptions: const ForegroundTaskOptions(
+      interval: 5000,        // ⏱ replaces eventAction.repeat
+      isOnceEvent: false,
       autoRunOnBoot: false,
       allowWakeLock: true,
       allowWifiLock: false,
@@ -443,15 +444,19 @@ class _HomePageState extends State<HomePage>
 
   static Map<String, dynamic> _parseJoggers(Map<String, dynamic> params) {
     final data = params['data'] as List;
-    final joggers = data
-        .map((j) => JoggerData(
-      name: j['name'],
-      lat: j['lat'],
-      lng: j['lng'],
-    ))
-        .toList();
+
+    final joggers = data.map((j) {
+      return JoggerData(
+        name: j['name'],
+        lat: j['lat'],
+        lng: j['lng'],
+        profileImage: j['profile_image'],
+      );
+    }).toList();
+
     return {'joggers': joggers};
   }
+
 
   Future<void> _loadUserWeight() async {
     final prefs = await SharedPreferences.getInstance();
@@ -485,20 +490,25 @@ class _HomePageState extends State<HomePage>
     setState(() => _myCurrentPos = newPos);
     _mapController.move(newPos, _mapController.camera.zoom);
 
-    // Geofencing check
+    // 1. Geofencing check
     _isInsideGround.value = _isPointInPolygon(newPos, _groundPolygonPoints);
 
-    // Navigation arrow
+    // 2. Navigation arrow (SMOOTHED)
     if (!_isInsideGround.value) {
-      _bearingToGround.value = Geolocator.bearingBetween(
+      // Calculate the raw target bearing
+      double targetBearing = Geolocator.bearingBetween(
         newPos.latitude,
         newPos.longitude,
         _groundCenter.latitude,
         _groundCenter.longitude,
       );
+
+      // Apply smoothing (Linear Interpolation)
+      // This prevents the arrow from "jumping" or flickering
+      _bearingToGround.value = _bearingToGround.value + (targetBearing - _bearingToGround.value) * 0.2;
     }
 
-    // Update session stats if jogging
+    // 3. Update session stats if jogging
     if (_isJogging) {
       _updateMovement(position);
       _broadcastLocation(newPos);
@@ -642,6 +652,7 @@ class _HomePageState extends State<HomePage>
       "name": _userName,
       "lat": _myCurrentPos!.latitude,
       "lng": _myCurrentPos!.longitude,
+      "profile_image": _remoteImageUrl,
     });
   }
 
@@ -849,46 +860,6 @@ class _HomePageState extends State<HomePage>
 
   /* ========================= UI COMPONENTS ========================= */
 
-  Widget _buildGuidanceArrow() {
-    return ValueListenableBuilder2<bool, double>(
-      _isInsideGround,
-      _bearingToGround,
-      builder: (context, isInside, bearing, _) {
-        if (isInside || _isJogging) return const SizedBox.shrink();
-
-        return Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(0.8),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: const Text(
-                  "Ground is this way! 🏃",
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 10),
-              Transform.rotate(
-                angle: bearing * (3.14159 / 180),
-                child: const Icon(
-                  Icons.navigation,
-                  size: 60,
-                  color: Colors.blueAccent,
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
 
   Widget _buildStatCard(
       String title,
@@ -1009,10 +980,31 @@ class _HomePageState extends State<HomePage>
             Expanded(child: _buildGroundView()),
           ],
         ),
-        _buildGuidanceArrow(),
       ],
     );
   }
+
+  Widget _buildJoggerAvatar(JoggerData j) {
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2),
+        image: j.profileImage != null
+            ? DecorationImage(
+          image: NetworkImage(j.profileImage!),
+          fit: BoxFit.cover,
+        )
+            : null,
+        color: Colors.blueAccent,
+      ),
+      child: j.profileImage == null
+          ? const Icon(Icons.person, color: Colors.white, size: 22)
+          : null,
+    );
+  }
+
 
   Widget _buildGroundView() {
     return Container(
@@ -1058,21 +1050,32 @@ class _HomePageState extends State<HomePage>
                     ...joggers.map(
                           (j) => Marker(
                         point: LatLng(j.lat, j.lng),
-                        child: const Icon(
-                          Icons.directions_run,
-                          color: Colors.red,
-                          size: 28,
-                        ),
-                      ),
+                            child: Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.white, width: 2),
+                                image: j.profileImage != null
+                                    ? DecorationImage(
+                                  image: NetworkImage(j.profileImage!),
+                                  fit: BoxFit.cover,
+                                )
+                                    : null,
+                                color: Colors.blueAccent,
+                              ),
+                              child: j.profileImage == null
+                                  ? const Icon(Icons.person, color: Colors.white, size: 22)
+                                  : null,
+                            ),
+                          ),
                     ),
                     if (_myCurrentPos != null)
                       Marker(
                         point: _myCurrentPos!,
-                        child: const Icon(
-                          Icons.person_pin_circle,
-                          color: Colors.blue,
-                          size: 40,
-                        ),
+                        width: 60,   // Set explicit width
+                        height: 60,  // Set explicit height
+                        child: _buildUserLocationPointer(), // New function call
                       ),
                   ],
                 );
@@ -1153,6 +1156,41 @@ class _HomePageState extends State<HomePage>
           ),
         );
       },
+    );
+  }
+
+  Widget _buildUserLocationPointer() {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        // Pulsing outer ring
+        TweenAnimationBuilder(
+          tween: Tween(begin: 0.0, end: 1.0),
+          duration: const Duration(seconds: 2),
+          builder: (context, double value, child) {
+            return Container(
+              width: 20 + (40 * value),
+              height: 20 + (40 * value),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.blue.withOpacity(1 - value),
+              ),
+            );
+          },
+        ),
+        // Directional arrow
+        const Icon(Icons.navigation, color: Colors.blue, size: 28),
+        // Solid center dot
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.blue, width: 2.5),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1253,6 +1291,8 @@ class _HomePageState extends State<HomePage>
   }
 }
 
+
+
 // Foreground task callback
 @pragma('vm:entry-point')
 void startCallback() {
@@ -1261,22 +1301,23 @@ void startCallback() {
 
 class JoggerTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+  void onStart(DateTime timestamp, SendPort? sendPort) {
     // Foreground service started
   }
 
   @override
-  Future<void> onRepeatEvent(DateTime timestamp) async {
+  void onRepeatEvent(DateTime timestamp, SendPort? sendPort) {
     FlutterForegroundTask.updateService(
       notificationText: 'Tracking jogging session...',
     );
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp) async {
+  void onDestroy(DateTime timestamp, SendPort? sendPort) {
     // Foreground service stopped
   }
 }
+
 
 
 
@@ -1310,13 +1351,16 @@ class JoggerData {
   final String name;
   final double lat;
   final double lng;
+  final String? profileImage;
 
   JoggerData({
     required this.name,
     required this.lat,
     required this.lng,
+    this.profileImage,
   });
 }
+
 
 /* ========================= STATS PAGE ========================= */
 
