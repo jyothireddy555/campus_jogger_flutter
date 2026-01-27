@@ -19,7 +19,9 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:isolate';
 import 'package:flutter_tts/flutter_tts.dart';
-
+import 'package:audioplayers/audioplayers.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:math' as math;
 
 void main() {
   FlutterForegroundTask.init(
@@ -35,7 +37,7 @@ void main() {
       playSound: false,
     ),
     foregroundTaskOptions: const ForegroundTaskOptions(
-      interval: 5000,        // ⏱ replaces eventAction.repeat
+      interval: 5000,
       isOnceEvent: false,
       autoRunOnBoot: false,
       allowWakeLock: true,
@@ -45,7 +47,6 @@ void main() {
 
   runApp(const MyApp());
 }
-
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: ['email'],
@@ -68,7 +69,7 @@ class MyApp extends StatelessWidget {
     );
   }
 }
-//for the auto open if the user already loged  in
+
 class SplashDecider extends StatefulWidget {
   const SplashDecider({super.key});
 
@@ -187,8 +188,7 @@ class _LoginPageState extends State<LoginPage> {
             ),
           ),
         );
-      }
-      else {
+      } else {
         throw Exception("Backend login failed");
       }
     } catch (e) {
@@ -259,6 +259,179 @@ class _LoginPageState extends State<LoginPage> {
   }
 }
 
+/* ========================= ENHANCED VOICE SYSTEM ========================= */
+
+enum VoicePersona {
+  girlfriend,
+  boyfriend,
+}
+
+/// 🎤 ULTRA-REALISTIC VOICE WITH NATURAL CONVERSATION FLOW
+class UltraRealisticVoice {
+  final AudioPlayer _player = AudioPlayer();
+  final FlutterTts _fallbackTts = FlutterTts();
+  final VoicePersona persona;
+  bool _useElevenLabs = true;
+  bool _isSpeaking = false;
+
+  // 🔥 Conversational context tracking
+  final List<String> _conversationHistory = [];
+  int _motivationCount = 0;
+
+  UltraRealisticVoice(this.persona);
+
+  bool get isSpeaking => _isSpeaking;
+
+  Future<void> initialize() async {
+    await _fallbackTts.setLanguage("en-US");
+    await _fallbackTts.setVolume(1.0);
+
+    if (persona == VoicePersona.girlfriend) {
+      await _fallbackTts.setPitch(1.2);
+      await _fallbackTts.setSpeechRate(0.42);
+    } else {
+      await _fallbackTts.setPitch(0.8);
+      await _fallbackTts.setSpeechRate(0.48);
+    }
+
+    // Listen for completion
+    _player.onPlayerComplete.listen((_) {
+      _isSpeaking = false;
+    });
+  }
+
+  /// 🎯 Smart speak with natural conversation flow
+  Future<void> speak(String text, {VoiceContext context = VoiceContext.motivation}) async {
+    if (_isSpeaking) {
+      await stop(); // Interrupt if already speaking
+    }
+
+    _isSpeaking = true;
+
+    // Add conversational variety based on context
+    final enhancedText = _enhanceWithContext(text, context);
+    _conversationHistory.add(enhancedText);
+    if (_conversationHistory.length > 5) {
+      _conversationHistory.removeAt(0);
+    }
+
+    if (_useElevenLabs && AppConfig.elevenLabsApiKey.isNotEmpty) {
+      final success = await _speakWithElevenLabs(enhancedText);
+      if (!success) {
+        debugPrint("ElevenLabs unavailable, using device TTS");
+        _useElevenLabs = false;
+        await _speakWithDeviceTTS(enhancedText);
+      }
+    } else {
+      await _speakWithDeviceTTS(enhancedText);
+    }
+  }
+
+  /// 🎨 Add natural conversation elements
+  String _enhanceWithContext(String text, VoiceContext context) {
+    _motivationCount++;
+
+    // Add natural fillers and variations
+    final intros = persona == VoicePersona.girlfriend
+        ? ['Hey babe', 'Listen hun', 'You know what', 'Sweetie', 'Hey you']
+        : ['Listen up', 'Yo', 'Check this out', 'Real talk', 'Hey man'];
+
+    final connectors = ['…', '... ', ' - '];
+
+    // Only add intro sometimes (feels more natural)
+    if (context == VoiceContext.motivation && _motivationCount % 2 == 0) {
+      final intro = intros[math.Random().nextInt(intros.length)];
+      final connector = connectors[math.Random().nextInt(connectors.length)];
+      return '$intro$connector$text';
+    }
+
+    return text;
+  }
+
+  Future<bool> _speakWithElevenLabs(String text) async {
+    // More expressive voice models for natural conversation
+    final voiceId = persona == VoicePersona.girlfriend
+        ? "21m00Tcm4TlvDq8ikWAM" // Rachel - warm, expressive
+        : "TxGEqnHWrfWFTfGW9XjX"; // Josh - deep, confident
+
+    try {
+      debugPrint("🎤 Speaking: $text");
+
+      final response = await http.post(
+        Uri.parse("https://api.elevenlabs.io/v1/text-to-speech/$voiceId/stream"),
+        headers: {
+          "Accept": "audio/mpeg",
+          "xi-api-key": AppConfig.elevenLabsApiKey,
+          "Content-Type": "application/json",
+        },
+        body: jsonEncode({
+          "text": text,
+          "model_id": "eleven_turbo_v2_5", // Latest model with better expressiveness
+          "voice_settings": {
+            // 🔥 More expressive, less robotic settings
+            "stability": persona == VoicePersona.girlfriend ? 0.25 : 0.35, // Lower = more variation
+            "similarity_boost": 0.85, // Voice consistency
+            "style": persona == VoicePersona.girlfriend ? 0.85 : 0.70, // Higher = more emotional
+            "use_speaker_boost": true,
+          },
+          // 🎯 Enable real-time streaming for faster playback
+          "optimize_streaming_latency": 3, // Max optimization
+        }),
+      ).timeout(const Duration(seconds: 12));
+
+      if (response.statusCode == 200) {
+        final tempDir = await getTemporaryDirectory();
+        final file = File('${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.mp3');
+        await file.writeAsBytes(response.bodyBytes);
+
+        await _player.stop();
+        await _player.play(DeviceFileSource(file.path));
+
+        // Cleanup after playback
+        _player.onPlayerComplete.listen((_) {
+          file.delete().catchError((e) => debugPrint("Cleanup: $e"));
+        });
+
+        return true;
+      } else {
+        debugPrint("❌ ElevenLabs error: ${response.statusCode}");
+      }
+    } catch (e) {
+      debugPrint("❌ ElevenLabs exception: $e");
+    }
+    return false;
+  }
+
+  Future<void> _speakWithDeviceTTS(String text) async {
+    await _fallbackTts.stop();
+    await _fallbackTts.speak(text);
+
+    // Mark as not speaking after estimated duration
+    final wordCount = text.split(' ').length;
+    final estimatedDuration = Duration(milliseconds: wordCount * 400);
+    Future.delayed(estimatedDuration, () => _isSpeaking = false);
+  }
+
+  Future<void> stop() async {
+    _isSpeaking = false;
+    await _player.stop();
+    await _fallbackTts.stop();
+  }
+
+  void dispose() {
+    _player.dispose();
+    _fallbackTts.stop();
+  }
+}
+
+enum VoiceContext {
+  motivation,
+  milestone,
+  warning,
+  encouragement,
+  celebration,
+}
+
 /* ========================= HOME PAGE ========================= */
 
 class HomePage extends StatefulWidget {
@@ -283,8 +456,15 @@ class _HomePageState extends State<HomePage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   @override
   bool get wantKeepAlive => true;
-  late FlutterTts _tts;
+
+  late UltraRealisticVoice _voice;
   DateTime? _lastSpokenAt;
+  late VoicePersona _voicePersona;
+
+  // 🎯 Smart motivation tracking
+  double _lastDistanceSpoken = 0.0;
+  double _lastSpeedSpoken = 0.0;
+  int _milestoneCount = 0;
 
   // Configuration
   static const double _defaultUserWeight = 60.0;
@@ -316,8 +496,7 @@ class _HomePageState extends State<HomePage>
   late IO.Socket _socket;
 
   // Notifiers
-  final ValueNotifier<List<JoggerData>> _activeJoggersNotifier =
-  ValueNotifier([]);
+  final ValueNotifier<List<JoggerData>> _activeJoggersNotifier = ValueNotifier([]);
   final ValueNotifier<bool> _isInsideGround = ValueNotifier(false);
   final ValueNotifier<double> _bearingToGround = ValueNotifier(0.0);
   final ValueNotifier<double> _totalDistance = ValueNotifier(0.0);
@@ -340,7 +519,6 @@ class _HomePageState extends State<HomePage>
   Timer? _notificationUpdateTimer;
   Timer? _aiMotivationTimer;
 
-
   @override
   void initState() {
     super.initState();
@@ -353,27 +531,30 @@ class _HomePageState extends State<HomePage>
     _startLiveTracking();
     _loadUserWeight();
     _fetchStreak();
-    _initTts();
+    _initVoice();
+  }
 
+  Future<void> _initVoice() async {
+    await _loadVoicePersona();
+
+    try {
+      await _voice.stop();
+      _voice.dispose();
+    } catch (_) {}
+
+    _voice = UltraRealisticVoice(_voicePersona);
+    await _voice.initialize();
   }
-  Future<void> _initTts() async {
-    _tts = FlutterTts();
-    await _tts.setLanguage("en-US");
-    await _tts.setSpeechRate(0.45);
-    await _tts.setPitch(1.1);
-  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // App lifecycle doesn't affect tracking when foreground service is active
     debugPrint("App state: $state");
   }
 
   Future<void> _requestPermissions() async {
-    // Request location permission
     final locationStatus = await Permission.location.request();
 
     if (locationStatus.isGranted) {
-      // Request background location for Android 10+
       if (Platform.isAndroid) {
         final bgLocationStatus = await Permission.locationAlways.request();
         if (!bgLocationStatus.isGranted) {
@@ -382,7 +563,6 @@ class _HomePageState extends State<HomePage>
       }
     }
 
-    // Request battery optimization exemption
     if (Platform.isAndroid) {
       await Permission.ignoreBatteryOptimizations.request();
     }
@@ -391,18 +571,25 @@ class _HomePageState extends State<HomePage>
   Future<void> _fetchStreak() async {
     try {
       final res = await http.get(
-        Uri.parse(
-          "${AppConfig.apiBase}/get_streak.php?user_id=${widget.userId}",
-        ),
+        Uri.parse("${AppConfig.apiBase}/get_streak.php?user_id=${widget.userId}"),
       );
 
       final data = jsonDecode(res.body);
-
       _streak.value = data['current_streak'] ?? 0;
       _todayKm.value = (data['today_km'] ?? 0).toDouble();
     } catch (_) {}
   }
 
+  Future<void> _loadVoicePersona() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString("voice_persona_${widget.email}");
+    _voicePersona = value == "boyfriend" ? VoicePersona.boyfriend : VoicePersona.girlfriend;
+  }
+
+  Future<void> _saveVoicePersona(VoicePersona persona) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString("voice_persona_${widget.email}", persona.name);
+  }
 
   void _showPermissionDialog() {
     showDialog(
@@ -438,19 +625,13 @@ class _HomePageState extends State<HomePage>
   void _initSocket() {
     _socket = IO.io(
       AppConfig.socketUrl,
-      IO.OptionBuilder()
-          .setTransports(['websocket'])
-          .disableAutoConnect()
-          .build(),
+      IO.OptionBuilder().setTransports(['websocket']).disableAutoConnect().build(),
     );
     _socket.connect();
 
     _socket.on("active_joggers", (data) {
       if (!mounted) return;
-      compute(_parseJoggers, {
-        'data': data,
-        'userId': widget.userId,
-      }).then((result) {
+      compute(_parseJoggers, {'data': data, 'userId': widget.userId}).then((result) {
         if (!mounted) return;
         _activeJoggersNotifier.value = result['joggers'];
       });
@@ -462,7 +643,7 @@ class _HomePageState extends State<HomePage>
     final int myId = params['userId'];
 
     final joggers = data
-        .where((j) => j['user_id'] != myId) // 👈 REMOVE YOURSELF
+        .where((j) => j['user_id'] != myId)
         .map((j) => JoggerData(
       name: j['name'],
       lat: j['lat'],
@@ -474,7 +655,13 @@ class _HomePageState extends State<HomePage>
     return {'joggers': joggers};
   }
 
-
+  /// 🎤 Enhanced speech with context awareness
+  Future<void> speakWithContext(String text, VoiceContext context) async {
+    if (_voice.isSpeaking) {
+      await _voice.stop();
+    }
+    await _voice.speak(text, context: context);
+  }
 
   Future<void> _loadUserWeight() async {
     final prefs = await SharedPreferences.getInstance();
@@ -508,28 +695,22 @@ class _HomePageState extends State<HomePage>
     setState(() => _myCurrentPos = newPos);
     _mapController.move(newPos, _mapController.camera.zoom);
 
-    // 1. Geofencing check
     _isInsideGround.value = _isPointInPolygon(newPos, _groundPolygonPoints);
 
-    // 2. Navigation arrow (SMOOTHED)
     if (!_isInsideGround.value) {
-      // Calculate the raw target bearing
       double targetBearing = Geolocator.bearingBetween(
         newPos.latitude,
         newPos.longitude,
         _groundCenter.latitude,
         _groundCenter.longitude,
       );
-
-      // Apply smoothing (Linear Interpolation)
-      // This prevents the arrow from "jumping" or flickering
       _bearingToGround.value = _bearingToGround.value + (targetBearing - _bearingToGround.value) * 0.2;
     }
 
-    // 3. Update session stats if jogging
     if (_isJogging) {
       _updateMovement(position);
       _broadcastLocation(newPos);
+      _checkMilestones(); // 🎯 Check for achievements
     }
   }
 
@@ -578,10 +759,8 @@ class _HomePageState extends State<HomePage>
     final met = _getMET(_avgSpeed.value);
     final caloriesPerSec = (met * _userWeightKg) / 3600;
 
-    // Calculate calories based on actual time elapsed since last update
     if (_lastUpdateTime != null) {
-      final secondsSinceLastUpdate =
-          DateTime.now().difference(_lastUpdateTime!).inSeconds;
+      final secondsSinceLastUpdate = DateTime.now().difference(_lastUpdateTime!).inSeconds;
       _calories.value += caloriesPerSec * secondsSinceLastUpdate;
     }
   }
@@ -592,13 +771,44 @@ class _HomePageState extends State<HomePage>
     _socketBatchTimer = Timer(Duration(seconds: _socketBatchSeconds), () {
       if (_pendingSocketUpdate != null) {
         _socket.emit("update_location", {
-          "user_id": widget.userId, // SERVER NOW USES THIS
+          "user_id": widget.userId,
           "lat": _pendingSocketUpdate!.latitude,
           "lng": _pendingSocketUpdate!.longitude,
         });
         _pendingSocketUpdate = null;
       }
     });
+  }
+
+  /// 🎯 Smart milestone detection with natural voice responses
+  void _checkMilestones() {
+    final distKm = _totalDistance.value / 1000;
+    final speed = _avgSpeed.value;
+
+    // Distance milestones (every 0.5 km)
+    if (distKm >= _lastDistanceSpoken + 0.5) {
+      _lastDistanceSpoken = distKm;
+      _speakMilestone("You've hit ${distKm.toStringAsFixed(1)} kilometers!", VoiceContext.milestone);
+    }
+
+    // Speed encouragement
+    if (speed > 8.0 && speed > _lastSpeedSpoken + 2.0) {
+      _lastSpeedSpoken = speed;
+      _speakMilestone("Damn, ${speed.toStringAsFixed(1)} km/h! You're flying!", VoiceContext.encouragement);
+    }
+
+    // Low speed warning
+    if (speed < 4.0 && _lastSpeedSpoken > 6.0) {
+      _lastSpeedSpoken = speed;
+      _speakMilestone("Hey, pick up the pace a bit!", VoiceContext.warning);
+    }
+  }
+
+  Future<void> _speakMilestone(String text, VoiceContext context) async {
+    if (!_canSpeak()) return;
+    _lastSpokenAt = DateTime.now();
+    _milestoneCount++;
+    await speakWithContext(text, context);
   }
 
   Future<void> _startForegroundService() async {
@@ -612,7 +822,6 @@ class _HomePageState extends State<HomePage>
       );
     }
 
-    // Start periodic notification updates
     _notificationUpdateTimer = Timer.periodic(
       const Duration(seconds: 5),
           (_) => _updateNotification(),
@@ -656,6 +865,9 @@ class _HomePageState extends State<HomePage>
       _totalDistance.value = 0;
       _avgSpeed.value = 0;
       _calories.value = 0;
+      _lastDistanceSpoken = 0.0;
+      _lastSpeedSpoken = 0.0;
+      _milestoneCount = 0;
     });
 
     _socket.emit("start_jog", {
@@ -666,22 +878,30 @@ class _HomePageState extends State<HomePage>
       "profile_image": _remoteImageUrl,
     });
 
-    // 💙 AI starts talking here
+    // 🎤 Welcome message
+    Future.delayed(const Duration(seconds: 2), () {
+      speakWithContext("Let's do this! I'm right here with you.", VoiceContext.encouragement);
+    });
+
+    // 🎤 Dynamic AI motivation (varies timing for naturalness)
     _aiMotivationTimer = Timer.periodic(
-      const Duration(seconds: 45),
+      const Duration(seconds: 50), // Slightly longer, less predictable
           (_) => _speakAiMotivation(),
     );
   }
 
-
   void _stopJog() async {
     setState(() => _isJogging = false);
 
-    // Disable wake lock
     await WakelockPlus.disable();
-
-    // Stop foreground service
     await _stopForegroundService();
+
+    // 🎤 Celebration
+    final distKm = (_totalDistance.value / 1000).toStringAsFixed(2);
+    speakWithContext(
+      "Amazing work! You crushed $distKm kilometers!",
+      VoiceContext.celebration,
+    );
 
     try {
       if (_startTime == null) return;
@@ -700,9 +920,6 @@ class _HomePageState extends State<HomePage>
       if (res.body.isEmpty) {
         throw Exception("Empty response from server");
       }
-
-      debugPrint("SAVE SESSION STATUS: ${res.statusCode}");
-      debugPrint("SAVE SESSION BODY: ${res.body}");
 
       final data = jsonDecode(res.body);
 
@@ -730,11 +947,10 @@ class _HomePageState extends State<HomePage>
 
     _socket.emit("stop_jog", {"user_id": widget.userId});
 
-    // Reset tracking variables
     _lastRecordedPos = null;
     _lastUpdateTime = null;
     _startTime = null;
-    _fetchStreak(); // 🔄 refresh streak & progress
+    _fetchStreak();
     _aiMotivationTimer?.cancel();
   }
 
@@ -812,12 +1028,8 @@ class _HomePageState extends State<HomePage>
                   radius: 55,
                   backgroundImage: tempImage != null
                       ? FileImage(tempImage!)
-                      : (_remoteImageUrl != null
-                      ? NetworkImage(_remoteImageUrl!)
-                      : null),
-                  child: tempImage == null && _remoteImageUrl == null
-                      ? const Icon(Icons.camera_alt)
-                      : null,
+                      : (_remoteImageUrl != null ? NetworkImage(_remoteImageUrl!) : null),
+                  child: tempImage == null && _remoteImageUrl == null ? const Icon(Icons.camera_alt) : null,
                 ),
               ),
               const SizedBox(height: 20),
@@ -825,13 +1037,44 @@ class _HomePageState extends State<HomePage>
                 controller: controller,
                 decoration: const InputDecoration(labelText: "Full Name"),
               ),
+              const SizedBox(height: 16),
+              const Text(
+                "Motivational Voice",
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  ChoiceChip(
+                    label: const Text("Girlfriend 💕"),
+                    selected: _voicePersona == VoicePersona.girlfriend,
+                    onSelected: (_) async {
+                      await _saveVoicePersona(VoicePersona.girlfriend);
+                      setSheetState(() {
+                        _voicePersona = VoicePersona.girlfriend;
+                      });
+                      await _initVoice();
+                    },
+                  ),
+                  ChoiceChip(
+                    label: const Text("Boyfriend 💪"),
+                    selected: _voicePersona == VoicePersona.boyfriend,
+                    onSelected: (_) async {
+                      await _saveVoicePersona(VoicePersona.boyfriend);
+                      setSheetState(() {
+                        _voicePersona = VoicePersona.boyfriend;
+                      });
+                      await _initVoice();
+                    },
+                  ),
+                ],
+              ),
               const SizedBox(height: 20),
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
-                  onPressed: _isSaving
-                      ? null
-                      : () => _saveProfile(context, controller.text, tempImage, setSheetState),
+                  onPressed: _isSaving ? null : () => _saveProfile(context, controller.text, tempImage, setSheetState),
                   child: const Text("Save"),
                 ),
               ),
@@ -879,7 +1122,7 @@ class _HomePageState extends State<HomePage>
 
   bool _canSpeak() {
     if (_lastSpokenAt == null) return true;
-    return DateTime.now().difference(_lastSpokenAt!).inSeconds > 45;
+    return DateTime.now().difference(_lastSpokenAt!).inSeconds > 35; // Slightly faster
   }
 
   Future<String?> _fetchAiMotivation() async {
@@ -912,13 +1155,10 @@ class _HomePageState extends State<HomePage>
     if (text == null || text.isEmpty) return;
 
     _lastSpokenAt = DateTime.now();
-    await _tts.stop();
-    await _tts.speak(text);
+    await speakWithContext(text, VoiceContext.motivation);
   }
 
-
   /* ========================= UI COMPONENTS ========================= */
-
 
   Widget _buildStatCard(
       String title,
@@ -1014,9 +1254,7 @@ class _HomePageState extends State<HomePage>
                   child: SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
-                      onPressed: (isInside || _isJogging)
-                          ? (_isJogging ? _stopJog : _startJog)
-                          : null,
+                      onPressed: (isInside || _isJogging) ? (_isJogging ? _stopJog : _startJog) : null,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: _isJogging ? Colors.red : Colors.green,
                         foregroundColor: Colors.white,
@@ -1026,9 +1264,7 @@ class _HomePageState extends State<HomePage>
                         ),
                       ),
                       child: Text(
-                        _isJogging
-                            ? "STOP SESSION"
-                            : (isInside ? "START JOGGING" : "LOCKED: ENTER GROUND"),
+                        _isJogging ? "STOP SESSION" : (isInside ? "START JOGGING" : "LOCKED: ENTER GROUND"),
                       ),
                     ),
                   ),
@@ -1042,28 +1278,6 @@ class _HomePageState extends State<HomePage>
       ],
     );
   }
-
-  Widget _buildJoggerAvatar(JoggerData j) {
-    return Container(
-      width: 40,
-      height: 40,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        border: Border.all(color: Colors.white, width: 2),
-        image: j.profileImage != null
-            ? DecorationImage(
-          image: NetworkImage(j.profileImage!),
-          fit: BoxFit.cover,
-        )
-            : null,
-        color: Colors.blueAccent,
-      ),
-      child: j.profileImage == null
-          ? const Icon(Icons.person, color: Colors.white, size: 22)
-          : null,
-    );
-  }
-
 
   Widget _buildGroundView() {
     return Container(
@@ -1109,32 +1323,30 @@ class _HomePageState extends State<HomePage>
                     ...joggers.map(
                           (j) => Marker(
                         point: LatLng(j.lat, j.lng),
-                            child: Container(
-                              width: 40,
-                              height: 40,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.white, width: 2),
-                                image: j.profileImage != null
-                                    ? DecorationImage(
-                                  image: NetworkImage(j.profileImage!),
-                                  fit: BoxFit.cover,
-                                )
-                                    : null,
-                                color: Colors.blueAccent,
-                              ),
-                              child: j.profileImage == null
-                                  ? const Icon(Icons.person, color: Colors.white, size: 22)
-                                  : null,
-                            ),
+                        child: Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 2),
+                            image: j.profileImage != null
+                                ? DecorationImage(
+                              image: NetworkImage(j.profileImage!),
+                              fit: BoxFit.cover,
+                            )
+                                : null,
+                            color: Colors.blueAccent,
                           ),
+                          child: j.profileImage == null ? const Icon(Icons.person, color: Colors.white, size: 22) : null,
+                        ),
+                      ),
                     ),
                     if (_myCurrentPos != null)
                       Marker(
                         point: _myCurrentPos!,
-                        width: 60,   // Set explicit width
-                        height: 60,  // Set explicit height
-                        child: _buildUserLocationPointer(), // New function call
+                        width: 60,
+                        height: 60,
+                        child: _buildUserLocationPointer(),
                       ),
                   ],
                 );
@@ -1175,8 +1387,7 @@ class _HomePageState extends State<HomePage>
             children: [
               Row(
                 children: [
-                  const Icon(Icons.local_fire_department,
-                      color: Colors.white, size: 28),
+                  const Icon(Icons.local_fire_department, color: Colors.white, size: 28),
                   const SizedBox(width: 10),
                   Text(
                     "$streak-day streak",
@@ -1188,21 +1399,16 @@ class _HomePageState extends State<HomePage>
                   ),
                 ],
               ),
-
               const SizedBox(height: 12),
-
               LinearProgressIndicator(
                 value: progress,
                 minHeight: 8,
                 backgroundColor: Colors.white.withOpacity(0.3),
-                valueColor:
-                const AlwaysStoppedAnimation<Color>(Colors.white),
+                valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
               ),
-
               const SizedBox(height: 8),
-
               Text(
-                km >= 0.6 //it is the daily base distance to walk or jog
+                km >= 0.6
                     ? "🔥 Streak saved for today!"
                     : "Walk ${(remaining * 1000).toInt()}m more to keep streak",
                 style: const TextStyle(
@@ -1222,7 +1428,6 @@ class _HomePageState extends State<HomePage>
     return Stack(
       alignment: Alignment.center,
       children: [
-        // Pulsing outer ring
         TweenAnimationBuilder(
           tween: Tween(begin: 0.0, end: 1.0),
           duration: const Duration(seconds: 2),
@@ -1237,12 +1442,10 @@ class _HomePageState extends State<HomePage>
             );
           },
         ),
-        // Directional arrow
         Transform.rotate(
           angle: _bearingToGround.value * (3.14159 / 180),
           child: const Icon(Icons.navigation, color: Colors.blue, size: 28),
         ),
-        // Solid center dot
         Container(
           width: 12,
           height: 12,
@@ -1255,7 +1458,6 @@ class _HomePageState extends State<HomePage>
       ],
     );
   }
-
 
   @override
   void dispose() {
@@ -1274,7 +1476,7 @@ class _HomePageState extends State<HomePage>
     WakelockPlus.disable();
     FlutterForegroundTask.stopService();
     _aiMotivationTimer?.cancel();
-    _tts.stop();
+    _voice.dispose();
     super.dispose();
   }
 
@@ -1293,12 +1495,8 @@ class _HomePageState extends State<HomePage>
                 radius: 18,
                 backgroundImage: _localImage != null
                     ? FileImage(_localImage!)
-                    : (_remoteImageUrl != null
-                    ? NetworkImage(_remoteImageUrl!)
-                    : null),
-                child: (_localImage == null && _remoteImageUrl == null)
-                    ? const Icon(Icons.person)
-                    : null,
+                    : (_remoteImageUrl != null ? NetworkImage(_remoteImageUrl!) : null),
+                child: (_localImage == null && _remoteImageUrl == null) ? const Icon(Icons.person) : null,
               ),
               const SizedBox(width: 10),
               Text(
@@ -1317,7 +1515,7 @@ class _HomePageState extends State<HomePage>
             icon: const Icon(Icons.logout, color: Colors.red),
             onPressed: () async {
               final prefs = await SharedPreferences.getInstance();
-              await prefs.clear(); // 👈 THIS IS THE FIX
+              await prefs.clear();
               await _googleSignIn.signOut();
 
               if (mounted) {
@@ -1355,8 +1553,6 @@ class _HomePageState extends State<HomePage>
   }
 }
 
-
-
 // Foreground task callback
 @pragma('vm:entry-point')
 void startCallback() {
@@ -1365,9 +1561,7 @@ void startCallback() {
 
 class JoggerTaskHandler extends TaskHandler {
   @override
-  void onStart(DateTime timestamp, SendPort? sendPort) {
-    // Foreground service started
-  }
+  void onStart(DateTime timestamp, SendPort? sendPort) {}
 
   @override
   void onRepeatEvent(DateTime timestamp, SendPort? sendPort) {
@@ -1377,13 +1571,8 @@ class JoggerTaskHandler extends TaskHandler {
   }
 
   @override
-  void onDestroy(DateTime timestamp, SendPort? sendPort) {
-    // Foreground service stopped
-  }
+  void onDestroy(DateTime timestamp, SendPort? sendPort) {}
 }
-
-
-
 
 /* ========================= HELPER WIDGETS ========================= */
 
@@ -1425,7 +1614,6 @@ class JoggerData {
   });
 }
 
-
 /* ========================= STATS PAGE ========================= */
 
 class StatsPage extends StatefulWidget {
@@ -1437,8 +1625,7 @@ class StatsPage extends StatefulWidget {
   State<StatsPage> createState() => _StatsPageState();
 }
 
-class _StatsPageState extends State<StatsPage>
-    with AutomaticKeepAliveClientMixin {
+class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixin {
   @override
   bool get wantKeepAlive => true;
 
@@ -1464,9 +1651,7 @@ class _StatsPageState extends State<StatsPage>
 
     try {
       final res = await http.get(
-        Uri.parse(
-          "${AppConfig.apiBase}/user_weekly_stats.php?user_id=${widget.userId}",
-        ),
+        Uri.parse("${AppConfig.apiBase}/user_weekly_stats.php?user_id=${widget.userId}"),
       ).timeout(const Duration(seconds: 10));
 
       if (!mounted) return;
@@ -1692,13 +1877,12 @@ class _StatsPageState extends State<StatsPage>
             isStrokeCapRound: true,
             dotData: FlDotData(
               show: true,
-              getDotPainter: (spot, percent, barData, index) =>
-                  FlDotCirclePainter(
-                    radius: 6,
-                    color: Colors.white,
-                    strokeWidth: 3,
-                    strokeColor: Colors.blueAccent,
-                  ),
+              getDotPainter: (spot, percent, barData, index) => FlDotCirclePainter(
+                radius: 6,
+                color: Colors.white,
+                strokeWidth: 3,
+                strokeColor: Colors.blueAccent,
+              ),
             ),
             belowBarData: BarAreaData(
               show: true,
@@ -1718,9 +1902,7 @@ class _StatsPageState extends State<StatsPage>
   }
 
   Widget _buildDistanceChart() {
-    final maxDistance = _distances.isEmpty
-        ? 4.0
-        : (_distances.reduce((a, b) => a > b ? a : b) * 1.2).ceilToDouble();
+    final maxDistance = _distances.isEmpty ? 4.0 : (_distances.reduce((a, b) => a > b ? a : b) * 1.2).ceilToDouble();
 
     return BarChart(
       BarChartData(
@@ -1862,7 +2044,9 @@ class _AllStatsPageState extends State<AllStatsPage> with SingleTickerProviderSt
 
           return RefreshIndicator(
             onRefresh: () async {
-              setState(() { _globalStatsFuture = _fetchGlobalStats(); });
+              setState(() {
+                _globalStatsFuture = _fetchGlobalStats();
+              });
             },
             child: CustomScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
@@ -1969,11 +2153,8 @@ class _AllStatsPageState extends State<AllStatsPage> with SingleTickerProviderSt
             leading: _buildRankBadge(index + 1),
             title: Text(item['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
             subtitle: index == 0 ? const Text("🏆 Current Leader", style: TextStyle(color: Colors.orange, fontSize: 11)) : null,
-            trailing: Text("$val $unit", style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: isTopThree ? Colors.blueAccent : Colors.black87,
-                fontSize: 16
-            )),
+            trailing: Text("$val $unit",
+                style: TextStyle(fontWeight: FontWeight.bold, color: isTopThree ? Colors.blueAccent : Colors.black87, fontSize: 16)),
           ),
         );
       },
@@ -1989,6 +2170,7 @@ class _AllStatsPageState extends State<AllStatsPage> with SingleTickerProviderSt
       child: Text("$rank", style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
     );
   }
+
   @override
   void dispose() {
     _tabController.dispose();
