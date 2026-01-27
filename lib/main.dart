@@ -366,16 +366,14 @@ class UltraRealisticVoice {
         },
         body: jsonEncode({
           "text": text,
-          "model_id": "eleven_turbo_v2_5", // Latest model with better expressiveness
+          "model_id": "eleven_turbo_v2_5",
           "voice_settings": {
-            // 🔥 More expressive, less robotic settings
-            "stability": persona == VoicePersona.girlfriend ? 0.25 : 0.35, // Lower = more variation
-            "similarity_boost": 0.85, // Voice consistency
-            "style": persona == VoicePersona.girlfriend ? 0.85 : 0.70, // Higher = more emotional
+            "stability": persona == VoicePersona.girlfriend ? 0.25 : 0.35,
+            "similarity_boost": 0.85,
+            "style": persona == VoicePersona.girlfriend ? 0.85 : 0.70,
             "use_speaker_boost": true,
           },
-          // 🎯 Enable real-time streaming for faster playback
-          "optimize_streaming_latency": 3, // Max optimization
+          "optimize_streaming_latency": 3,
         }),
       ).timeout(const Duration(seconds: 12));
 
@@ -458,10 +456,19 @@ class _HomePageState extends State<HomePage>
   bool get wantKeepAlive => true;
 
   late UltraRealisticVoice _voice;
-  DateTime? _lastSpokenAt;
+
+  // ✅ FIX #6: Context-aware voice timing instead of single cooldown
+  Map<VoiceContext, DateTime?> _lastSpokenByContext = {
+    VoiceContext.motivation: null,
+    VoiceContext.milestone: null,
+    VoiceContext.warning: null,
+    VoiceContext.encouragement: null,
+    VoiceContext.celebration: null,
+  };
+
   late VoicePersona _voicePersona;
 
-  // 🎯 Smart motivation tracking
+  // ✅ FIX #5: Track milestone boundaries correctly
   double _lastDistanceSpoken = 0.0;
   double _lastSpeedSpoken = 0.0;
   int _milestoneCount = 0;
@@ -516,6 +523,10 @@ class _HomePageState extends State<HomePage>
   DateTime? _lastUpdateTime;
   Timer? _socketBatchTimer;
   LatLng? _pendingSocketUpdate;
+
+  // ✅ FIX #4: Add tracking for last socket broadcast
+  DateTime? _lastSocketBroadcast;
+
   Timer? _notificationUpdateTimer;
   Timer? _aiMotivationTimer;
 
@@ -710,22 +721,30 @@ class _HomePageState extends State<HomePage>
     if (_isJogging) {
       _updateMovement(position);
       _broadcastLocation(newPos);
-      _checkMilestones(); // 🎯 Check for achievements
+      _checkMilestones();
     }
   }
 
+  // ✅ FIX #1: CORRECTED DISTANCE AND SPEED CALCULATION
   void _updateMovement(Position pos) {
     final now = DateTime.now();
     final newPos = LatLng(pos.latitude, pos.longitude);
 
-    if (pos.accuracy > _maxGpsAccuracy) return;
-
-    if (_lastRecordedPos == null) {
-      _lastRecordedPos = newPos;
-      _lastUpdateTime = now;
+    // Reject low accuracy readings
+    if (pos.accuracy > _maxGpsAccuracy) {
+      debugPrint("⚠️ GPS accuracy too low: ${pos.accuracy}m");
       return;
     }
 
+    // Initialize on first reading
+    if (_lastRecordedPos == null || _lastUpdateTime == null) {
+      _lastRecordedPos = newPos;
+      _lastUpdateTime = now;
+      debugPrint("📍 First position recorded");
+      return;
+    }
+
+    // Calculate distance between last position and current position
     final distance = Geolocator.distanceBetween(
       _lastRecordedPos!.latitude,
       _lastRecordedPos!.longitude,
@@ -733,80 +752,171 @@ class _HomePageState extends State<HomePage>
       newPos.longitude,
     );
 
-    if (distance < _minDistanceMeters) return;
+    // Filter out GPS jitter (movements less than minimum threshold)
+    if (distance < _minDistanceMeters) {
+      debugPrint("⚠️ Movement too small: ${distance.toStringAsFixed(2)}m");
+      return;
+    }
 
-    final duration = now.difference(_lastUpdateTime!).inMilliseconds;
-    if (duration > 0) {
-      final speedKmh = (distance / (duration / 1000)) * 3.6;
-      if (speedKmh < _maxSpeedKmh) {
-        _totalDistance.value += distance;
-        _todayKm.value = _totalDistance.value / 1000;
-        _lastRecordedPos = newPos;
-        _lastUpdateTime = now;
-        _updateStats();
-      }
+    // ✅ CRITICAL FIX: Calculate time difference BEFORE updating _lastUpdateTime
+    final durationSeconds = now.difference(_lastUpdateTime!).inSeconds;
+
+    // Ensure we have positive duration
+    if (durationSeconds <= 0) {
+      debugPrint("⚠️ Invalid time duration: $durationSeconds seconds");
+      return;
+    }
+
+    // Calculate instantaneous speed: speed (m/s) = distance (m) / time (s)
+    // Convert to km/h: multiply by 3.6
+    final speedKmh = (distance / durationSeconds) * 3.6;
+
+    // Validate speed is physically realistic for jogging/running
+    if (speedKmh >= 0.5 && speedKmh < _maxSpeedKmh) {
+      // ✅ VALID MOVEMENT - Update all tracking variables
+
+      // Add to total distance
+      _totalDistance.value += distance;
+      _todayKm.value = _totalDistance.value / 1000;
+
+      // ✅ CRITICAL: Update position and time TOGETHER and IMMEDIATELY
+      _lastRecordedPos = newPos;
+      _lastUpdateTime = now;
+
+      // Calculate segment calories based on instantaneous speed
+      final met = _getMET(speedKmh);
+      final segmentHours = durationSeconds / 3600.0;
+      final segmentCalories = met * _userWeightKg * segmentHours;
+      _calories.value += segmentCalories;
+
+      // Update average speed for the entire session
+      _updateAverageSpeed();
+
+      debugPrint("✅ Valid movement: ${distance.toStringAsFixed(2)}m in ${durationSeconds}s = ${speedKmh.toStringAsFixed(1)} km/h");
+    } else {
+      // Invalid speed - likely GPS error
+      debugPrint("⚠️ Speed rejected: ${speedKmh.toStringAsFixed(1)} km/h (distance: ${distance.toStringAsFixed(2)}m, duration: ${durationSeconds}s)");
+
+      // ✅ FIX: Even if speed is invalid, update time to prevent accumulation errors
+      // But DON'T update position or add distance
+      _lastUpdateTime = now;
     }
   }
 
-  void _updateStats() {
+  // ✅ FIX #2: CORRECTED AVERAGE SPEED CALCULATION
+  void _updateAverageSpeed() {
     if (_startTime == null) return;
 
-    final seconds = DateTime.now().difference(_startTime!).inSeconds;
-    if (seconds >= 1) {
-      _avgSpeed.value = (_totalDistance.value / seconds) * 3.6;
-    }
+    // Calculate total session duration in seconds
+    final totalSeconds = DateTime.now().difference(_startTime!).inSeconds;
 
-    final met = _getMET(_avgSpeed.value);
-    final caloriesPerSec = (met * _userWeightKg) / 3600;
-
-    if (_lastUpdateTime != null) {
-      final secondsSinceLastUpdate = DateTime.now().difference(_lastUpdateTime!).inSeconds;
-      _calories.value += caloriesPerSec * secondsSinceLastUpdate;
+    if (totalSeconds >= 1) {
+      // Average speed = total distance / total time
+      // Convert from m/s to km/h by multiplying by 3.6
+      _avgSpeed.value = (_totalDistance.value / totalSeconds) * 3.6;
     }
   }
 
+  // ✅ FIX #4: CORRECTED SOCKET BROADCASTING WITH PROPER BATCHING
   void _broadcastLocation(LatLng pos) {
+    final now = DateTime.now();
+
+    // Always update to latest position
     _pendingSocketUpdate = pos;
+
+    // Check if enough time has passed since last broadcast
+    if (_lastSocketBroadcast != null &&
+        now.difference(_lastSocketBroadcast!).inSeconds < _socketBatchSeconds) {
+      // Timer is already running, just keep the latest position
+      return;
+    }
+
+    // Cancel any existing timer
     _socketBatchTimer?.cancel();
+
+    // Set up new broadcast timer
     _socketBatchTimer = Timer(Duration(seconds: _socketBatchSeconds), () {
-      if (_pendingSocketUpdate != null) {
+      if (_pendingSocketUpdate != null && _socket.connected) {
         _socket.emit("update_location", {
           "user_id": widget.userId,
           "lat": _pendingSocketUpdate!.latitude,
           "lng": _pendingSocketUpdate!.longitude,
+          "speed": _avgSpeed.value,
+          "timestamp": DateTime.now().millisecondsSinceEpoch,
         });
+        _lastSocketBroadcast = DateTime.now();
         _pendingSocketUpdate = null;
+        debugPrint("📡 Location broadcast: ${_pendingSocketUpdate!.latitude}, ${_pendingSocketUpdate!.longitude}");
       }
     });
   }
 
-  /// 🎯 Smart milestone detection with natural voice responses
+  // ✅ FIX #5: CORRECTED MILESTONE DETECTION
   void _checkMilestones() {
     final distKm = _totalDistance.value / 1000;
     final speed = _avgSpeed.value;
 
-    // Distance milestones (every 0.5 km)
-    if (distKm >= _lastDistanceSpoken + 0.5) {
-      _lastDistanceSpoken = distKm;
-      _speakMilestone("You've hit ${distKm.toStringAsFixed(1)} kilometers!", VoiceContext.milestone);
+    // Distance milestones - trigger every 0.5 km
+    final currentMilestone = (distKm / 0.5).floor() * 0.5;
+    final lastMilestone = (_lastDistanceSpoken / 0.5).floor() * 0.5;
+
+    if (currentMilestone > lastMilestone && currentMilestone > 0) {
+      _lastDistanceSpoken = currentMilestone;
+      _speakMilestone(
+          "You've hit ${currentMilestone.toStringAsFixed(1)} kilometers!",
+          VoiceContext.milestone
+      );
+      debugPrint("🏆 Milestone reached: ${currentMilestone}km");
     }
 
-    // Speed encouragement
-    if (speed > 8.0 && speed > _lastSpeedSpoken + 2.0) {
+    // Speed encouragement - only when crossing 8.0 km/h threshold
+    if (speed > 8.0 && _lastSpeedSpoken <= 8.0) {
       _lastSpeedSpoken = speed;
-      _speakMilestone("Damn, ${speed.toStringAsFixed(1)} km/h! You're flying!", VoiceContext.encouragement);
+      _speakMilestone(
+          "Damn, ${speed.toStringAsFixed(1)} km/h! You're flying!",
+          VoiceContext.encouragement
+      );
+    } else if (speed > 8.0) {
+      _lastSpeedSpoken = speed; // Update silently
     }
 
-    // Low speed warning
-    if (speed < 4.0 && _lastSpeedSpoken > 6.0) {
+    // Low speed warning - only when dropping below 4.0 km/h threshold
+    if (speed < 4.0 && _lastSpeedSpoken >= 4.0) {
       _lastSpeedSpoken = speed;
-      _speakMilestone("Hey, pick up the pace a bit!", VoiceContext.warning);
+      _speakMilestone(
+          "Hey, pick up the pace a bit!",
+          VoiceContext.warning
+      );
+    } else if (speed < 4.0) {
+      _lastSpeedSpoken = speed; // Update silently
     }
   }
 
+  // ✅ FIX #6: CONTEXT-AWARE VOICE COOLDOWNS
+  bool _canSpeak(VoiceContext context) {
+    final lastSpoken = _lastSpokenByContext[context];
+
+    if (lastSpoken == null) return true;
+
+    // Different cooldowns for different contexts
+    final cooldownSeconds = switch (context) {
+      VoiceContext.milestone => 10,      // Quick response to achievements
+      VoiceContext.warning => 30,        // Don't nag too much
+      VoiceContext.encouragement => 20,  // Moderate frequency
+      VoiceContext.motivation => 40,     // Background motivation
+      VoiceContext.celebration => 0,     // Always allow
+    };
+
+    return DateTime.now().difference(lastSpoken).inSeconds > cooldownSeconds;
+  }
+
   Future<void> _speakMilestone(String text, VoiceContext context) async {
-    if (!_canSpeak()) return;
-    _lastSpokenAt = DateTime.now();
+    if (!_canSpeak(context)) {
+      debugPrint("🔇 Speech blocked by cooldown: $context");
+      return;
+    }
+
+    _lastSpokenByContext[context] = DateTime.now();
     _milestoneCount++;
     await speakWithContext(text, context);
   }
@@ -862,12 +972,23 @@ class _HomePageState extends State<HomePage>
       _startTime = DateTime.now();
       _lastRecordedPos = _myCurrentPos;
       _lastUpdateTime = DateTime.now();
+
+      // Reset all tracking variables
       _totalDistance.value = 0;
       _avgSpeed.value = 0;
       _calories.value = 0;
       _lastDistanceSpoken = 0.0;
       _lastSpeedSpoken = 0.0;
       _milestoneCount = 0;
+
+      // Reset voice cooldowns
+      _lastSpokenByContext = {
+        VoiceContext.motivation: null,
+        VoiceContext.milestone: null,
+        VoiceContext.warning: null,
+        VoiceContext.encouragement: null,
+        VoiceContext.celebration: null,
+      };
     });
 
     _socket.emit("start_jog", {
@@ -883,14 +1004,18 @@ class _HomePageState extends State<HomePage>
       speakWithContext("Let's do this! I'm right here with you.", VoiceContext.encouragement);
     });
 
-    // 🎤 Dynamic AI motivation (varies timing for naturalness)
+    // 🎤 Dynamic AI motivation
     _aiMotivationTimer = Timer.periodic(
-      const Duration(seconds: 50), // Slightly longer, less predictable
+      const Duration(seconds: 50),
           (_) => _speakAiMotivation(),
     );
+
+    debugPrint("🏃 Jog started at ${_startTime}");
   }
 
   void _stopJog() async {
+    debugPrint("🛑 Stopping jog...");
+
     setState(() => _isJogging = false);
 
     await WakelockPlus.disable();
@@ -898,20 +1023,28 @@ class _HomePageState extends State<HomePage>
 
     // 🎤 Celebration
     final distKm = (_totalDistance.value / 1000).toStringAsFixed(2);
+    final totalMinutes = DateTime.now().difference(_startTime!).inMinutes;
     speakWithContext(
-      "Amazing work! You crushed $distKm kilometers!",
+      "Amazing work! You crushed $distKm kilometers in $totalMinutes minutes!",
       VoiceContext.celebration,
     );
 
     try {
-      if (_startTime == null) return;
+      if (_startTime == null) {
+        debugPrint("⚠️ No start time - session not saved");
+        return;
+      }
+
+      final durationSeconds = DateTime.now().difference(_startTime!).inSeconds;
+
+      debugPrint("💾 Saving session: ${(_totalDistance.value / 1000).toStringAsFixed(2)}km, ${durationSeconds}s, ${_calories.value.round()}cal");
 
       final res = await http.post(
         Uri.parse("${AppConfig.apiBase}/save_session.php"),
         body: {
           "user_id": widget.userId.toString(),
           "distance": (_totalDistance.value / 1000).toString(),
-          "duration": DateTime.now().difference(_startTime!).inSeconds.toString(),
+          "duration": durationSeconds.toString(),
           "calories": _calories.value.round().toString(),
           "avg_speed": _avgSpeed.value.toString(),
         },
@@ -931,15 +1064,18 @@ class _HomePageState extends State<HomePage>
             duration: Duration(seconds: 2),
           ),
         );
+        debugPrint("✅ Session saved successfully");
+      } else {
+        throw Exception("Server returned error: ${data['message']}");
       }
     } catch (e) {
-      debugPrint("SAVE SESSION ERROR: $e");
+      debugPrint("❌ SAVE SESSION ERROR: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Failed to save session"),
+          SnackBar(
+            content: Text("Failed to save session: $e"),
             backgroundColor: Colors.red,
-            duration: Duration(seconds: 2),
+            duration: Duration(seconds: 3),
           ),
         );
       }
@@ -947,19 +1083,23 @@ class _HomePageState extends State<HomePage>
 
     _socket.emit("stop_jog", {"user_id": widget.userId});
 
+    // Reset session variables
     _lastRecordedPos = null;
     _lastUpdateTime = null;
     _startTime = null;
+    _lastSocketBroadcast = null;
+
     _fetchStreak();
     _aiMotivationTimer?.cancel();
   }
 
   double _getMET(double speedKmh) {
-    if (speedKmh < 6) return 4.3;
-    if (speedKmh < 7.5) return 6.0;
-    if (speedKmh < 9) return 7.0;
-    if (speedKmh < 11) return 9.8;
-    return 11.5;
+    // MET (Metabolic Equivalent of Task) values for different speeds
+    if (speedKmh < 6) return 4.3;      // Slow jogging
+    if (speedKmh < 7.5) return 6.0;    // Light jogging
+    if (speedKmh < 9) return 7.0;      // Moderate jogging
+    if (speedKmh < 11) return 9.8;     // Running
+    return 11.5;                        // Fast running
   }
 
   bool _isPointInPolygon(LatLng point, List<LatLng> polygon) {
@@ -1120,11 +1260,6 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  bool _canSpeak() {
-    if (_lastSpokenAt == null) return true;
-    return DateTime.now().difference(_lastSpokenAt!).inSeconds > 35; // Slightly faster
-  }
-
   Future<String?> _fetchAiMotivation() async {
     try {
       final res = await http.post(
@@ -1149,12 +1284,12 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _speakAiMotivation() async {
-    if (!_isJogging || !_canSpeak()) return;
+    if (!_isJogging || !_canSpeak(VoiceContext.motivation)) return;
 
     final text = await _fetchAiMotivation();
     if (text == null || text.isEmpty) return;
 
-    _lastSpokenAt = DateTime.now();
+    _lastSpokenByContext[VoiceContext.motivation] = DateTime.now();
     await speakWithContext(text, VoiceContext.motivation);
   }
 
