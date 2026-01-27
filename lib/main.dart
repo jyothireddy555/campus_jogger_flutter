@@ -18,6 +18,8 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:isolate';
+import 'package:flutter_tts/flutter_tts.dart';
+
 
 void main() {
   FlutterForegroundTask.init(
@@ -281,6 +283,8 @@ class _HomePageState extends State<HomePage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   @override
   bool get wantKeepAlive => true;
+  late FlutterTts _tts;
+  DateTime? _lastSpokenAt;
 
   // Configuration
   static const double _defaultUserWeight = 60.0;
@@ -334,6 +338,8 @@ class _HomePageState extends State<HomePage>
   Timer? _socketBatchTimer;
   LatLng? _pendingSocketUpdate;
   Timer? _notificationUpdateTimer;
+  Timer? _aiMotivationTimer;
+
 
   @override
   void initState() {
@@ -347,8 +353,15 @@ class _HomePageState extends State<HomePage>
     _startLiveTracking();
     _loadUserWeight();
     _fetchStreak();
-  }
+    _initTts();
 
+  }
+  Future<void> _initTts() async {
+    _tts = FlutterTts();
+    await _tts.setLanguage("en-US");
+    await _tts.setSpeechRate(0.45);
+    await _tts.setPitch(1.1);
+  }
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // App lifecycle doesn't affect tracking when foreground service is active
@@ -579,7 +592,7 @@ class _HomePageState extends State<HomePage>
     _socketBatchTimer = Timer(Duration(seconds: _socketBatchSeconds), () {
       if (_pendingSocketUpdate != null) {
         _socket.emit("update_location", {
-          "user_id": widget.userId,
+          "user_id": widget.userId, // SERVER NOW USES THIS
           "lat": _pendingSocketUpdate!.latitude,
           "lng": _pendingSocketUpdate!.longitude,
         });
@@ -625,21 +638,14 @@ class _HomePageState extends State<HomePage>
   }
 
   void _startJog() async {
-    // Safety check: ensure GPS has locked position
     if (_myCurrentPos == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Waiting for GPS location..."),
-          duration: Duration(seconds: 2),
-        ),
+        const SnackBar(content: Text("Waiting for GPS location...")),
       );
       return;
     }
 
-    // Enable wake lock to prevent CPU sleep
     await WakelockPlus.enable();
-
-    // Start foreground service
     await _startForegroundService();
 
     setState(() {
@@ -659,7 +665,14 @@ class _HomePageState extends State<HomePage>
       "lng": _myCurrentPos!.longitude,
       "profile_image": _remoteImageUrl,
     });
+
+    // 💙 AI starts talking here
+    _aiMotivationTimer = Timer.periodic(
+      const Duration(seconds: 45),
+          (_) => _speakAiMotivation(),
+    );
   }
+
 
   void _stopJog() async {
     setState(() => _isJogging = false);
@@ -722,6 +735,7 @@ class _HomePageState extends State<HomePage>
     _lastUpdateTime = null;
     _startTime = null;
     _fetchStreak(); // 🔄 refresh streak & progress
+    _aiMotivationTimer?.cancel();
   }
 
   double _getMET(double speedKmh) {
@@ -862,6 +876,46 @@ class _HomePageState extends State<HomePage>
       if (mounted) setSheetState(() => _isSaving = false);
     }
   }
+
+  bool _canSpeak() {
+    if (_lastSpokenAt == null) return true;
+    return DateTime.now().difference(_lastSpokenAt!).inSeconds > 45;
+  }
+
+  Future<String?> _fetchAiMotivation() async {
+    try {
+      final res = await http.post(
+        Uri.parse("${AppConfig.socketUrl}/motivation"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "distance": (_totalDistance.value / 1000).toStringAsFixed(2),
+          "speed": _avgSpeed.value.toStringAsFixed(1),
+          "calories": _calories.value.toStringAsFixed(0),
+          "others": _activeJoggersNotifier.value.length,
+        }),
+      );
+
+      if (res.statusCode != 200) return null;
+
+      final data = jsonDecode(res.body);
+      return data["text"];
+    } catch (e) {
+      debugPrint("AI ERROR: $e");
+      return null;
+    }
+  }
+
+  Future<void> _speakAiMotivation() async {
+    if (!_isJogging || !_canSpeak()) return;
+
+    final text = await _fetchAiMotivation();
+    if (text == null || text.isEmpty) return;
+
+    _lastSpokenAt = DateTime.now();
+    await _tts.stop();
+    await _tts.speak(text);
+  }
+
 
   /* ========================= UI COMPONENTS ========================= */
 
@@ -1219,6 +1273,8 @@ class _HomePageState extends State<HomePage>
     _calories.dispose();
     WakelockPlus.disable();
     FlutterForegroundTask.stopService();
+    _aiMotivationTimer?.cancel();
+    _tts.stop();
     super.dispose();
   }
 
