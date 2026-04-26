@@ -5,7 +5,8 @@ import 'main.dart'; // contains HomePage
 
 class UserDetailsPage extends StatefulWidget {
   final String userEmail;
-  final int userId;
+  // ✅ FIX #2: userId is a String (MongoDB ObjectId)
+  final String userId;
   final bool isEdit;
   final String userName;
   final String? profileImageUrl;

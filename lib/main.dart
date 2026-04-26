@@ -107,7 +107,8 @@ class _SplashDeciderState extends State<SplashDecider> {
         MaterialPageRoute(
           builder: (_) => UserDetailsPage(
             userEmail: email,
-            userId: prefs.getInt("user_id")!,
+            // ✅ FIX #2: Read user_id as String
+            userId: prefs.getString("user_id")!,
             userName: prefs.getString("name")!,
             profileImageUrl: prefs.getString("profile_image"),
           ),
@@ -118,7 +119,8 @@ class _SplashDeciderState extends State<SplashDecider> {
         context,
         MaterialPageRoute(
           builder: (_) => HomePage(
-            userId: prefs.getInt("user_id")!,
+            // ✅ FIX #2: Read user_id as String
+            userId: prefs.getString("user_id")!,
             email: email,
             name: prefs.getString("name")!,
             profileImageUrl: prefs.getString("profile_image"),
@@ -159,6 +161,12 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       final auth = await account.authentication;
+
+      // ✅ Issue 1: id_token can be null if Google Play services are flaky
+      if (auth.idToken == null) {
+        throw Exception("Google id_token is null — try signing in again");
+      }
+
       final res = await http.post(
         Uri.parse(AppConfig.backendUrl),
         body: {"id_token": auth.idToken!},
@@ -170,10 +178,15 @@ class _LoginPageState extends State<LoginPage> {
         final prefs = await SharedPreferences.getInstance();
 
         await prefs.setBool("is_logged_in", true);
-        await prefs.setInt("user_id", data["user_id"]);
+        // ✅ FIX #2: Store user_id as String (MongoDB ObjectId is a string)
+        await prefs.setString("user_id", data["user_id"].toString());
         await prefs.setString("email", data["email"]);
         await prefs.setString("name", data["name"]);
         await prefs.setString("profile_image", data["profile_image"] ?? "");
+        // ✅ FIX: Save JWT token for authenticated requests
+        if (data["token"] != null) {
+          await prefs.setString("jwt_token", data["token"]);
+        }
 
         if (!mounted) return;
 
@@ -182,7 +195,7 @@ class _LoginPageState extends State<LoginPage> {
           MaterialPageRoute(
             builder: (_) => UserDetailsPage(
               userEmail: data["email"],
-              userId: data["user_id"],
+              userId: data["user_id"].toString(),
               userName: data["name"],
               profileImageUrl: data["profile_image"],
             ),
@@ -348,57 +361,64 @@ class UltraRealisticVoice {
     return text;
   }
 
-  Future<bool> _speakWithElevenLabs(String text) async {
-    // More expressive voice models for natural conversation
-    final voiceId = persona == VoicePersona.girlfriend
-        ? "21m00Tcm4TlvDq8ikWAM" // Rachel - warm, expressive
-        : "TxGEqnHWrfWFTfGW9XjX"; // Josh - deep, confident
+ StreamSubscription? _audioSub; // add this field at the top of UltraRealisticVoice
 
-    try {
-      debugPrint("🎤 Speaking: $text");
+Future<bool> _speakWithElevenLabs(String text) async {
+  final voiceId = persona == VoicePersona.girlfriend
+      ? "21m00Tcm4TlvDq8ikWAM"
+      : "TxGEqnHWrfWFTfGW9XjX";
 
-      final response = await http.post(
-        Uri.parse("https://api.elevenlabs.io/v1/text-to-speech/$voiceId/stream"),
-        headers: {
-          "Accept": "audio/mpeg",
-          "xi-api-key": AppConfig.elevenLabsApiKey,
-          "Content-Type": "application/json",
+  try {
+    debugPrint("🎤 ElevenLabs key: ${AppConfig.elevenLabsApiKey.substring(0, 8)}...");
+    debugPrint("🎤 Speaking: $text");
+
+    final response = await http.post(
+      Uri.parse("https://api.elevenlabs.io/v1/text-to-speech/$voiceId/stream"),
+      headers: {
+        "Accept": "audio/mpeg",
+        "xi-api-key": AppConfig.elevenLabsApiKey,
+        "Content-Type": "application/json",
+      },
+      body: jsonEncode({
+        "text": text,
+        "model_id": "eleven_turbo_v2_5",
+        "voice_settings": {
+          "stability": persona == VoicePersona.girlfriend ? 0.25 : 0.35,
+          "similarity_boost": 0.85,
+          "style": persona == VoicePersona.girlfriend ? 0.85 : 0.70,
+          "use_speaker_boost": true,
         },
-        body: jsonEncode({
-          "text": text,
-          "model_id": "eleven_turbo_v2_5",
-          "voice_settings": {
-            "stability": persona == VoicePersona.girlfriend ? 0.25 : 0.35,
-            "similarity_boost": 0.85,
-            "style": persona == VoicePersona.girlfriend ? 0.85 : 0.70,
-            "use_speaker_boost": true,
-          },
-          "optimize_streaming_latency": 3,
-        }),
-      ).timeout(const Duration(seconds: 12));
+        "optimize_streaming_latency": 3,
+      }),
+    ).timeout(const Duration(seconds: 12));
 
-      if (response.statusCode == 200) {
-        final tempDir = await getTemporaryDirectory();
-        final file = File('${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.mp3');
-        await file.writeAsBytes(response.bodyBytes);
+    debugPrint("🎤 ElevenLabs status: ${response.statusCode}");
 
-        await _player.stop();
-        await _player.play(DeviceFileSource(file.path));
+    if (response.statusCode == 200) {
+      final tempDir = await getTemporaryDirectory();
+      final file = File('${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.mp3');
+      await file.writeAsBytes(response.bodyBytes);
+      debugPrint("🎤 Audio saved: ${file.path} (${response.bodyBytes.length} bytes)");
 
-        // Cleanup after playback
-        _player.onPlayerComplete.listen((_) {
-          file.delete().catchError((e) => debugPrint("Cleanup: $e"));
-        });
+      await _player.stop();
 
-        return true;
-      } else {
-        debugPrint("❌ ElevenLabs error: ${response.statusCode}");
-      }
-    } catch (e) {
-      debugPrint("❌ ElevenLabs exception: $e");
+      // ✅ Cancel old listener before adding new one
+      await _audioSub?.cancel();
+      _audioSub = _player.onPlayerComplete.listen((_) async {
+        _isSpeaking = false;
+        try { await file.delete(); } catch (e) { debugPrint("Cleanup: $e"); }
+      });
+
+      await _player.play(DeviceFileSource(file.path));
+      return true;
+    } else {
+      debugPrint("❌ ElevenLabs error: ${response.statusCode} — ${response.body}");
     }
-    return false;
+  } catch (e) {
+    debugPrint("❌ ElevenLabs exception: $e");
   }
+  return false;
+}
 
   Future<void> _speakWithDeviceTTS(String text) async {
     await _fallbackTts.stop();
@@ -417,9 +437,10 @@ class UltraRealisticVoice {
   }
 
   void dispose() {
-    _player.dispose();
-    _fallbackTts.stop();
-  }
+  _audioSub?.cancel(); // ✅ add this
+  _player.dispose();
+  _fallbackTts.stop();
+}
 }
 
 enum VoiceContext {
@@ -436,7 +457,8 @@ class HomePage extends StatefulWidget {
   final String name;
   final String email;
   final String? profileImageUrl;
-  final int userId;
+  // ✅ FIX #2: userId is a String (MongoDB ObjectId)
+  final String userId;
 
   const HomePage({
     super.key,
@@ -454,6 +476,9 @@ class _HomePageState extends State<HomePage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   @override
   bool get wantKeepAlive => true;
+
+  // ✅ Issue 4: Track disposal to prevent using MapController after dispose
+  bool _isDisposed = false;
 
   late UltraRealisticVoice _voice;
 
@@ -542,6 +567,7 @@ class _HomePageState extends State<HomePage>
     _startLiveTracking();
     _loadUserWeight();
     _fetchStreak();
+    _voice = UltraRealisticVoice(VoicePersona.girlfriend);
     _initVoice();
   }
 
@@ -581,8 +607,11 @@ class _HomePageState extends State<HomePage>
 
   Future<void> _fetchStreak() async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("jwt_token") ?? "";
       final res = await http.get(
-        Uri.parse("${AppConfig.apiBase}/get_streak.php?user_id=${widget.userId}"),
+        Uri.parse("${AppConfig.apiBase}/streak?user_id=${widget.userId}"),
+        headers: {"Authorization": "Bearer $token"},
       );
 
       final data = jsonDecode(res.body);
@@ -628,9 +657,10 @@ class _HomePageState extends State<HomePage>
   }
 
   void _initializeProfileImage() {
-    if (widget.profileImageUrl != null && widget.profileImageUrl!.isNotEmpty) {
-      _remoteImageUrl = "${AppConfig.baseImageUrl}/${widget.profileImageUrl}";
-    }
+    final img = widget.profileImageUrl;
+    if (img == null || img.isEmpty) return;
+    // ✅ Cloudinary returns a full https:// URL; old local storage returns just a filename
+    _remoteImageUrl = img.startsWith("http") ? img : "${AppConfig.baseImageUrl}/$img";
   }
 
   void _initSocket() {
@@ -651,10 +681,11 @@ class _HomePageState extends State<HomePage>
 
   static Map<String, dynamic> _parseJoggers(Map<String, dynamic> params) {
     final List data = params['data'];
-    final int myId = params['userId'];
+    // ✅ FIX #2: userId is a String (MongoDB ObjectId)
+    final String myId = params['userId'].toString();
 
     final joggers = data
-        .where((j) => j['user_id'] != myId)
+        .where((j) => j['user_id'].toString() != myId)
         .map((j) => JoggerData(
       name: j['name'],
       lat: j['lat'],
@@ -701,10 +732,14 @@ class _HomePageState extends State<HomePage>
   void _onPositionUpdate(Position position) {
     final newPos = LatLng(position.latitude, position.longitude);
 
-    if (!mounted) return;
+    if (!mounted || _isDisposed) return;
 
     setState(() => _myCurrentPos = newPos);
-    _mapController.move(newPos, _mapController.camera.zoom);
+
+    // ✅ Issue 4: Guard MapController — it throws if used after dispose
+    try {
+      _mapController.move(newPos, _mapController.camera.zoom);
+    } catch (_) {}
 
     _isInsideGround.value = _isPointInPolygon(newPos, _groundPolygonPoints);
 
@@ -1039,10 +1074,15 @@ class _HomePageState extends State<HomePage>
 
       debugPrint("💾 Saving session: ${(_totalDistance.value / 1000).toStringAsFixed(2)}km, ${durationSeconds}s, ${_calories.value.round()}cal");
 
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("jwt_token") ?? "";
+
       final res = await http.post(
-        Uri.parse("${AppConfig.apiBase}/save_session.php"),
+        Uri.parse("${AppConfig.apiBase}/sessions"),
+        headers: {"Authorization": "Bearer $token"},
         body: {
-          "user_id": widget.userId.toString(),
+          // ✅ FIX #2: user_id is already a String
+          "user_id": widget.userId,
           "distance": (_totalDistance.value / 1000).toString(),
           "duration": durationSeconds.toString(),
           "calories": _calories.value.round().toString(),
@@ -1135,6 +1175,7 @@ class _HomePageState extends State<HomePage>
   void _openProfileSheet() {
     final controller = TextEditingController(text: _userName);
     File? tempImage = _localImage;
+    bool _pickingImage = false; // guard against double-tap crash
 
     showModalBottomSheet(
       context: context,
@@ -1155,13 +1196,23 @@ class _HomePageState extends State<HomePage>
             children: [
               GestureDetector(
                 onTap: () async {
-                  final picked = await ImagePicker().pickImage(
-                    source: ImageSource.gallery,
-                    imageQuality: 70,
-                    maxWidth: 512,
-                  );
-                  if (picked != null) {
-                    setSheetState(() => tempImage = File(picked.path));
+                  // ✅ Guard: ImagePicker throws PlatformException
+                  //    'already_active' if tapped while already open
+                  if (_pickingImage) return;
+                  _pickingImage = true;
+                  try {
+                    final picked = await ImagePicker().pickImage(
+                      source: ImageSource.gallery,
+                      imageQuality: 70,
+                      maxWidth: 512,
+                    );
+                    if (picked != null) {
+                      setSheetState(() => tempImage = File(picked.path));
+                    }
+                  } catch (e) {
+                    debugPrint("Image picker error: $e");
+                  } finally {
+                    _pickingImage = false;
                   }
                 },
                 child: CircleAvatar(
@@ -1234,10 +1285,16 @@ class _HomePageState extends State<HomePage>
     setSheetState(() => _isSaving = true);
 
     try {
+      // ✅ FIX #3: Load JWT token and attach Authorization header
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("jwt_token") ?? "";
+
       final request = http.MultipartRequest(
         "POST",
         Uri.parse(AppConfig.updateProfileUrl),
       );
+      // ✅ FIX #3: Required by Node.js auth middleware
+      request.headers['Authorization'] = 'Bearer $token';
       request.fields['email'] = widget.email;
       request.fields['profile_name'] = newName;
 
@@ -1249,11 +1306,23 @@ class _HomePageState extends State<HomePage>
 
       final response = await request.send();
       if (mounted && response.statusCode == 200) {
+        final body = await response.stream.bytesToString();
+        final data = jsonDecode(body);
+        // Update locally stored name
+        await prefs.setString("name", newName);
+        if (data['profile_image'] != null && data['profile_image'].toString().isNotEmpty) {
+          final imgUrl = data['profile_image'].toString();
+          await prefs.setString("profile_image", imgUrl);
+          setState(() {
+            // ✅ Cloudinary gives full URL; local gives filename
+            _remoteImageUrl = imgUrl.startsWith("http") ? imgUrl : "${AppConfig.baseImageUrl}/$imgUrl";
+          });
+        }
         setState(() {
           _userName = newName;
           _localImage = newImage;
         });
-        Navigator.pop(context);
+        if (mounted) Navigator.pop(context);
       }
     } finally {
       if (mounted) setSheetState(() => _isSaving = false);
@@ -1262,9 +1331,14 @@ class _HomePageState extends State<HomePage>
 
   Future<String?> _fetchAiMotivation() async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("jwt_token") ?? "";
       final res = await http.post(
         Uri.parse("${AppConfig.socketUrl}/motivation"),
-        headers: {"Content-Type": "application/json"},
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer $token",
+        },
         body: jsonEncode({
           "distance": (_totalDistance.value / 1000).toStringAsFixed(2),
           "speed": _avgSpeed.value.toStringAsFixed(1),
@@ -1596,10 +1670,12 @@ class _HomePageState extends State<HomePage>
 
   @override
   void dispose() {
+    _isDisposed = true;  // ✅ Issue 4: set BEFORE cancelling stream
     WidgetsBinding.instance.removeObserver(this);
     _positionStream?.cancel();
     _socketBatchTimer?.cancel();
     _notificationUpdateTimer?.cancel();
+    _aiMotivationTimer?.cancel();
     _socket.dispose();
     _pageController.dispose();
     _activeJoggersNotifier.dispose();
@@ -1610,7 +1686,6 @@ class _HomePageState extends State<HomePage>
     _calories.dispose();
     WakelockPlus.disable();
     FlutterForegroundTask.stopService();
-    _aiMotivationTimer?.cancel();
     _voice.dispose();
     super.dispose();
   }
@@ -1752,7 +1827,8 @@ class JoggerData {
 /* ========================= STATS PAGE ========================= */
 
 class StatsPage extends StatefulWidget {
-  final int userId;
+  // ✅ FIX #2: userId is a String (MongoDB ObjectId)
+  final String userId;
 
   const StatsPage({super.key, required this.userId});
 
@@ -1785,8 +1861,11 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
     });
 
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("jwt_token") ?? "";
       final res = await http.get(
-        Uri.parse("${AppConfig.apiBase}/user_weekly_stats.php?user_id=${widget.userId}"),
+        Uri.parse("${AppConfig.apiBase}/stats?user_id=${widget.userId}"),
+        headers: {"Authorization": "Bearer $token"},
       ).timeout(const Duration(seconds: 10));
 
       if (!mounted) return;
@@ -2155,8 +2234,12 @@ class _AllStatsPageState extends State<AllStatsPage> with SingleTickerProviderSt
   }
 
   Future<Map<String, dynamic>> _fetchGlobalStats() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString("jwt_token") ?? "";
     final res = await http.get(
-      Uri.parse("${AppConfig.apiBase}/get_global_stats.php"),
+      // ✅ /stats/global for leaderboards; /stats is user weekly stats
+      Uri.parse("${AppConfig.apiBase}/stats/global"),
+      headers: {"Authorization": "Bearer $token"},
     ).timeout(const Duration(seconds: 10));
     return jsonDecode(res.body);
   }
